@@ -1,0 +1,28 @@
+import type { User } from "../types";
+
+const TOKEN_KEY = "crisislaw_token";
+const USER_KEY = "crisislaw_user";
+
+export function saveSession(token: string, user: User) {
+  localStorage.setItem(TOKEN_KEY, token);
+  localStorage.setItem(USER_KEY, JSON.stringify(user));
+}
+
+export function getCurrentUser(): User | null {
+  const raw = localStorage.getItem(USER_KEY);
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw) as User;
+  } catch {
+    return null;
+  }
+}
+
+export function isLoggedIn(): boolean {
+  return !!localStorage.getItem(TOKEN_KEY);
+}
+
+export function logout() {
+  localStorage.removeItem(TOKEN_KEY);
+  localStorage.removeItem(USER_KEY);
+}

@@ -1,0 +1,426 @@
+diff --git a/server.ts b/server.ts
+index b2cfbfc..8e729f4 100644
+--- a/server.ts
++++ b/server.ts
+@@ -1,11 +1,51 @@
+ import "dotenv/config";
+ import express from "express";
+ import path from "path";
++import fs from "fs";
++import crypto from "crypto";
+ import { createServer as createViteServer } from "vite";
+ import { GoogleGenAI } from "@google/genai";
+ 
+ const PORT = 3000;
+ 
++// === Real user persistence (JSON file) ===
++// این یک پایگاه‌داده حرفه‌ای نیست، اما برخلاف آرایه‌های حافظه‌ای قبلی،
++// اطلاعات را واقعاً روی دیسک ذخیره می‌کند و با ری‌استارت سرور از بین نمی‌رود.
++const DATA_DIR = path.join(process.cwd(), "data");
++const USERS_FILE = path.join(DATA_DIR, "users.json");
++
++interface StoredUser {
++  id: string;
++  firstName: string;
++  lastName: string;
++  fullName: string;
++  nationalCode: string;
++  phone: string;
++  role: "Citizen";
++  createdAt: string;
++}
++
++function loadUsers(): StoredUser[] {
++  try {
++    if (!fs.existsSync(USERS_FILE)) return [];
++    return JSON.parse(fs.readFileSync(USERS_FILE, "utf-8"));
++  } catch (e) {
++    console.error("خطا در خواندن users.json:", e);
++    return [];
++  }
++}
++
++function saveUsers(users: StoredUser[]) {
++  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
++  fs.writeFileSync(USERS_FILE, JSON.stringify(users, null, 2), "utf-8");
++}
++
++// کد تایید هر شماره موبایل: phone -> { code, expiresAt }
++const otpStore = new Map<string, { code: string; expiresAt: number }>();
++
++// نشست‌های فعال: token -> userId  (جایگزین ساده به‌جای JWT واقعی)
++const sessions = new Map<string, string>();
++
+ let ai: GoogleGenAI | null = null;
+ function getAI() {
+   if (!ai) {
+@@ -36,10 +76,98 @@ async function startServer() {
+     res.json({ status: "ok" });
+   });
+ 
+-  // Mock Auth
+-  app.post("/api/auth/login", (req, res) => {
+-    const { email } = req.body;
+-    res.json({ token: "mock-jwt-token-123", user: { id: "u1", email, role: "Citizen", fullName: "کاربر تستی" } });
++  // === Real Auth ===
++
++  // ثبت‌نام کاربر جدید
++  app.post("/api/auth/register", (req, res) => {
++    const { firstName, lastName, nationalCode, phone } = req.body ?? {};
++
++    if (!firstName?.trim() || !lastName?.trim() || !nationalCode?.trim() || !phone?.trim()) {
++      return res.status(400).json({ error: "تکمیل تمام فیلدها الزامی است." });
++    }
++    if (!/^\d{10}$/.test(nationalCode)) {
++      return res.status(400).json({ error: "کد ملی باید دقیقاً ۱۰ رقم باشد." });
++    }
++    if (!/^09\d{9}$/.test(phone)) {
++      return res.status(400).json({ error: "شماره موبایل معتبر نیست (مثال: 09123456789)." });
++    }
++
++    const users = loadUsers();
++    if (users.some((u) => u.phone === phone)) {
++      return res.status(409).json({ error: "کاربری با این شماره موبایل قبلاً ثبت‌نام کرده است." });
++    }
++    if (users.some((u) => u.nationalCode === nationalCode)) {
++      return res.status(409).json({ error: "کاربری با این کد ملی قبلاً ثبت‌نام کرده است." });
++    }
++
++    const user: StoredUser = {
++      id: crypto.randomUUID(),
++      firstName: firstName.trim(),
++      lastName: lastName.trim(),
++      fullName: `${firstName.trim()} ${lastName.trim()}`,
++      nationalCode,
++      phone,
++      role: "Citizen",
++      createdAt: new Date().toISOString(),
++    };
++
++    users.push(user);
++    saveUsers(users);
++
++    const token = crypto.randomUUID();
++    sessions.set(token, user.id);
++
++    res.status(201).json({ token, user });
++  });
++
++  // مرحله ۱ ورود: ارسال کد تایید به کاربر ثبت‌نام‌شده
++  app.post("/api/auth/otp/send", (req, res) => {
++    const { phone } = req.body ?? {};
++    if (!/^09\d{9}$/.test(phone ?? "")) {
++      return res.status(400).json({ error: "شماره موبایل معتبر نیست." });
++    }
++
++    const users = loadUsers();
++    const user = users.find((u) => u.phone === phone);
++    if (!user) {
++      return res.status(404).json({ error: "کاربری با این شماره موبایل یافت نشد. ابتدا ثبت‌نام کنید." });
++    }
++
++    const code = Math.floor(1000 + Math.random() * 9000).toString();
++    otpStore.set(phone, { code, expiresAt: Date.now() + 2 * 60 * 1000 });
++
++    // TODO: این بخش باید در نسخه واقعی با یک سرویس پیامک (کاوه‌نگار، ملی‌پیامک و ...) جایگزین شود.
++    console.log(`[OTP] کد ورود برای ${phone}: ${code}`);
++
++    res.json({
++      ok: true,
++      // فقط در محیط توسعه، برای راحتی تست بدون سرویس پیامک واقعی
++      devCode: process.env.NODE_ENV !== "production" ? code : undefined,
++    });
++  });
++
++  // مرحله ۲ ورود: بررسی کد و صدور نشست ورود
++  app.post("/api/auth/otp/verify", (req, res) => {
++    const { phone, otp } = req.body ?? {};
++    const entry = otpStore.get(phone);
++
++    if (!entry || entry.expiresAt < Date.now()) {
++      return res.status(400).json({ error: "کد منقضی شده است. دوباره درخواست دهید." });
++    }
++    if (entry.code !== otp) {
++      return res.status(400).json({ error: "کد وارد شده صحیح نیست." });
++    }
++    otpStore.delete(phone);
++
++    const users = loadUsers();
++    const user = users.find((u) => u.phone === phone);
++    if (!user) {
++      return res.status(404).json({ error: "کاربری با این شماره موبایل یافت نشد." });
++    }
++
++    const token = crypto.randomUUID();
++    sessions.set(token, user.id);
++    res.json({ token, user });
+   });
+ 
+   // Ask AI Question (Streaming SSE)
+diff --git a/src/pages/CitizenDashboard.tsx b/src/pages/CitizenDashboard.tsx
+index afbc37c..317bf19 100644
+--- a/src/pages/CitizenDashboard.tsx
++++ b/src/pages/CitizenDashboard.tsx
+@@ -1,11 +1,12 @@
+ import { useState, useRef, useEffect } from "react";
+ import { motion } from "motion/react";
+-import { Link } from "react-router-dom";
++import { Link, useNavigate } from "react-router-dom";
+ import { Shield, Home, FileText, Search, Settings, LogOut, Send, Bot, User, Scale, AlertTriangle, ChevronLeft, Loader2, Copy, CheckCircle2, RotateCcw, Building2, Target } from "lucide-react";
+ import ReactMarkdown from 'react-markdown';
+ import remarkGfm from 'remark-gfm';
+ import rehypeRaw from 'rehype-raw';
+ import { Button } from "../components/ui/Button";
++import { getCurrentUser, logout } from "../lib/auth";
+ 
+ const SIDEBAR_ITEMS = [
+   { icon: Home, label: "داشبورد", active: false, path: "/dashboard/citizen" },
+@@ -17,6 +18,13 @@ const SIDEBAR_ITEMS = [
+ ];
+ 
+ export default function CitizenDashboard() {
++  const navigate = useNavigate();
++  const user = getCurrentUser();
++
++  useEffect(() => {
++    if (!user) navigate("/auth/login");
++  }, [user, navigate]);
++
+   const [queryTitle, setQueryTitle] = useState("");
+   const [queryDesc, setQueryDesc] = useState("");
+   const [isAsking, setIsAsking] = useState(false);
+@@ -171,7 +179,10 @@ export default function CitizenDashboard() {
+         </div>
+ 
+         <div className="p-6 border-t border-black/5">
+-          <button className="w-full flex items-center gap-4 px-4 py-4 rounded-[16px] text-[#64748B] hover:text-[#EF4444] hover:bg-[#FEF2F2] transition-all text-[16px] font-semibold">
++          <button
++            onClick={() => { logout(); navigate("/"); }}
++            className="w-full flex items-center gap-4 px-4 py-4 rounded-[16px] text-[#64748B] hover:text-[#EF4444] hover:bg-[#FEF2F2] transition-all text-[16px] font-semibold"
++          >
+             <LogOut className="w-[22px] h-[22px]" />
+             خروج از حساب
+           </button>
+@@ -185,11 +196,11 @@ export default function CitizenDashboard() {
+           <h2 className="text-[24px] font-bold text-[#0F172A]">مشاوره هوشمند AI</h2>
+           <div className="flex items-center gap-5">
+             <div className="text-left hidden sm:block">
+-              <p className="text-[16px] font-bold text-[#0F172A] leading-tight mb-1">شهروند گرامی</p>
++              <p className="text-[16px] font-bold text-[#0F172A] leading-tight mb-1">{user?.fullName || "شهروند گرامی"}</p>
+               <p className="text-[14px] text-[#64748B]">ایران، تهران</p>
+             </div>
+             <div className="w-12 h-12 rounded-full bg-[#0D9488] border-4 border-white shadow-sm flex items-center justify-center text-white font-bold text-lg">
+-              م
++              {user?.firstName?.charAt(0) || "م"}
+             </div>
+           </div>
+         </header>
+diff --git a/src/pages/Login.tsx b/src/pages/Login.tsx
+index a6e86e7..ea7dd41 100644
+--- a/src/pages/Login.tsx
++++ b/src/pages/Login.tsx
+@@ -4,6 +4,7 @@ import { motion, AnimatePresence } from "motion/react";
+ import { Shield, ArrowRight, Loader2, KeyRound } from "lucide-react";
+ import { Input } from "../components/ui/Input";
+ import { Button } from "../components/ui/Button";
++import { saveSession } from "../lib/auth";
+ 
+ export default function Login() {
+   const navigate = useNavigate();
+@@ -11,23 +12,55 @@ export default function Login() {
+   const [step, setStep] = useState<1 | 2>(1);
+   const [phone, setPhone] = useState("");
+   const [otp, setOtp] = useState("");
++  const [error, setError] = useState("");
++  const [devCode, setDevCode] = useState<string | null>(null);
+ 
+-  const handleSendCode = (e: React.FormEvent) => {
++  const handleSendCode = async (e: React.FormEvent) => {
+     e.preventDefault();
++    setError("");
+     setIsLoading(true);
+-    setTimeout(() => {
+-      setIsLoading(false);
++    try {
++      const res = await fetch("/api/auth/otp/send", {
++        method: "POST",
++        headers: { "Content-Type": "application/json" },
++        body: JSON.stringify({ phone }),
++      });
++      const data = await res.json();
++      if (!res.ok) {
++        setError(data.error || "خطا در ارسال کد. دوباره تلاش کنید.");
++        return;
++      }
++      setDevCode(data.devCode ?? null);
+       setStep(2);
+-    }, 1200);
++    } catch (e) {
++      setError("ارتباط با سرور برقرار نشد.");
++    } finally {
++      setIsLoading(false);
++    }
+   };
+ 
+-  const handleVerifyOtp = (e: React.FormEvent) => {
++  const handleVerifyOtp = async (e: React.FormEvent) => {
+     e.preventDefault();
++    setError("");
+     setIsLoading(true);
+-    setTimeout(() => {
+-      setIsLoading(false);
++    try {
++      const res = await fetch("/api/auth/otp/verify", {
++        method: "POST",
++        headers: { "Content-Type": "application/json" },
++        body: JSON.stringify({ phone, otp }),
++      });
++      const data = await res.json();
++      if (!res.ok) {
++        setError(data.error || "کد وارد شده صحیح نیست.");
++        return;
++      }
++      saveSession(data.token, data.user);
+       navigate("/dashboard/citizen");
+-    }, 1500);
++    } catch (e) {
++      setError("ارتباط با سرور برقرار نشد.");
++    } finally {
++      setIsLoading(false);
++    }
+   };
+ 
+   return (
+@@ -52,6 +85,18 @@ export default function Login() {
+           </p>
+         </div>
+ 
++        {error && (
++          <div className="bg-[#FEF2F2] border border-[#FECACA] text-[#B91C1C] text-[14px] font-medium rounded-xl px-4 py-3 text-center mb-6">
++            {error}
++          </div>
++        )}
++
++        {step === 2 && devCode && (
++          <div className="bg-[#F0FDF4] border border-[#BBF7D0] text-[#166534] text-[13px] font-medium rounded-xl px-4 py-3 text-center mb-6">
++            کد تست (فقط محیط توسعه، جایگزین پیامک واقعی): <span dir="ltr" className="font-bold">{devCode}</span>
++          </div>
++        )}
++
+         <AnimatePresence mode="wait">
+           {step === 1 && (
+             <motion.form 
+@@ -103,7 +148,7 @@ export default function Login() {
+                   value={otp}
+                   onChange={(e) => setOtp(e.target.value)}
+                 />
+-                <button type="button" onClick={() => setStep(1)} className="text-[13px] text-[#0D9488] mt-2 font-medium">ویرایش شماره موبایل</button>
++                <button type="button" onClick={() => { setStep(1); setError(""); setDevCode(null); }} className="text-[13px] text-[#0D9488] mt-2 font-medium">ویرایش شماره موبایل</button>
+               </div>
+               
+               <Button type="submit" size="lg" className="w-full mt-4" disabled={isLoading || otp.length < 4}>
+diff --git a/src/pages/Register.tsx b/src/pages/Register.tsx
+index 4f9bc6c..96cc1b9 100644
+--- a/src/pages/Register.tsx
++++ b/src/pages/Register.tsx
+@@ -4,19 +4,42 @@ import { motion } from "motion/react";
+ import { Shield, ArrowRight, Loader2, UserPlus } from "lucide-react";
+ import { Input } from "../components/ui/Input";
+ import { Button } from "../components/ui/Button";
++import { saveSession } from "../lib/auth";
+ 
+ export default function Register() {
+   const navigate = useNavigate();
+   const [isLoading, setIsLoading] = useState(false);
++  const [error, setError] = useState("");
++  const [firstName, setFirstName] = useState("");
++  const [lastName, setLastName] = useState("");
++  const [nationalCode, setNationalCode] = useState("");
++  const [phone, setPhone] = useState("");
+ 
+-  const handleRegister = (e: React.FormEvent) => {
++  const handleRegister = async (e: React.FormEvent) => {
+     e.preventDefault();
++    setError("");
+     setIsLoading(true);
+-    // Mock register delay
+-    setTimeout(() => {
+-      setIsLoading(false);
++
++    try {
++      const res = await fetch("/api/auth/register", {
++        method: "POST",
++        headers: { "Content-Type": "application/json" },
++        body: JSON.stringify({ firstName, lastName, nationalCode, phone }),
++      });
++      const data = await res.json();
++
++      if (!res.ok) {
++        setError(data.error || "خطا در ثبت‌نام. دوباره تلاش کنید.");
++        return;
++      }
++
++      saveSession(data.token, data.user);
+       navigate("/dashboard/citizen");
+-    }, 1500);
++    } catch (e) {
++      setError("ارتباط با سرور برقرار نشد.");
++    } finally {
++      setIsLoading(false);
++    }
+   };
+ 
+   return (
+@@ -40,25 +63,31 @@ export default function Register() {
+         </div>
+ 
+         <form onSubmit={handleRegister} className="space-y-5">
++          {error && (
++            <div className="bg-[#FEF2F2] border border-[#FECACA] text-[#B91C1C] text-[14px] font-medium rounded-xl px-4 py-3 text-center">
++              {error}
++            </div>
++          )}
++
+           <div className="grid grid-cols-2 gap-4">
+             <div className="space-y-2">
+               <label className="text-[15px] font-semibold text-[#0F172A] pr-1">نام</label>
+-              <Input type="text" required placeholder="مثال: علی" />
++              <Input type="text" required placeholder="مثال: علی" value={firstName} onChange={(e) => setFirstName(e.target.value)} />
+             </div>
+             <div className="space-y-2">
+               <label className="text-[15px] font-semibold text-[#0F172A] pr-1">نام خانوادگی</label>
+-              <Input type="text" required placeholder="مثال: محمدی" />
++              <Input type="text" required placeholder="مثال: محمدی" value={lastName} onChange={(e) => setLastName(e.target.value)} />
+             </div>
+           </div>
+ 
+           <div className="space-y-2">
+             <label className="text-[15px] font-semibold text-[#0F172A] pr-1">کد ملی</label>
+-            <Input type="text" required placeholder="مثال: 0012345678" maxLength={10} className="text-left" dir="ltr" />
++            <Input type="text" required placeholder="مثال: 0012345678" maxLength={10} className="text-left" dir="ltr" value={nationalCode} onChange={(e) => setNationalCode(e.target.value.replace(/\D/g, ""))} />
+           </div>
+ 
+           <div className="space-y-2">
+             <label className="text-[15px] font-semibold text-[#0F172A] pr-1">شماره موبایل</label>
+-            <Input type="tel" required placeholder="09123456789" maxLength={11} className="text-left" dir="ltr" />
++            <Input type="tel" required placeholder="09123456789" maxLength={11} className="text-left" dir="ltr" value={phone} onChange={(e) => setPhone(e.target.value.replace(/\D/g, ""))} />
+           </div>
+ 
+           <Button type="submit" size="lg" className="w-full mt-6" disabled={isLoading}>
+diff --git a/src/types.ts b/src/types.ts
+index 7b2f13a..9527dc0 100644
+--- a/src/types.ts
++++ b/src/types.ts
+@@ -2,8 +2,11 @@ export type Role = 'Citizen' | 'LegalExpert' | 'Admin';
+ 
+ export interface User {
+   id: string;
++  firstName: string;
++  lastName: string;
+   fullName: string;
+-  email: string;
++  nationalCode: string;
++  phone: string;
+   role: Role;
+   createdAt: string;
+ }
