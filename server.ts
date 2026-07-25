@@ -1,50 +1,50 @@
 import "dotenv/config";
 import express from "express";
+import cors from "cors";
 import path from "path";
-import fs from "fs";
-import crypto from "crypto";
+import rateLimit from "express-rate-limit";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI } from "@google/genai";
+import { OAuth2Client } from "google-auth-library";
 
-const PORT = 3000;
+import { isValidIranianNationalCode } from "./nationalId";
+import {
+  initDb,
+  getUserByPhone,
+  getUserByNationalCode,
+  getUserByEmail,
+  getUserByGoogleId,
+  insertUser,
+  linkGoogleId,
+  createSession,
+  getUserBySessionToken,
+  deleteSession,
+  insertConsultation,
+  saveConsultationResponse,
+  getUserHistory,
+  toPublicUser,
+  type DbUser,
+} from "./db";
 
-// === Real user persistence (JSON file) ===
-// این یک پایگاه‌داده حرفه‌ای نیست، اما برخلاف آرایه‌های حافظه‌ای قبلی،
-// اطلاعات را واقعاً روی دیسک ذخیره می‌کند و با ری‌استارت سرور از بین نمی‌رود.
-const DATA_DIR = path.join(process.cwd(), "data");
-const USERS_FILE = path.join(DATA_DIR, "users.json");
+const PORT = Number(process.env.PORT) || 3000;
 
-interface StoredUser {
-  id: string;
-  firstName: string;
-  lastName: string;
-  fullName: string;
-  nationalCode: string;
-  phone: string;
-  role: "Citizen";
-  createdAt: string;
-}
-
-function loadUsers(): StoredUser[] {
-  try {
-    if (!fs.existsSync(USERS_FILE)) return [];
-    return JSON.parse(fs.readFileSync(USERS_FILE, "utf-8"));
-  } catch (e) {
-    console.error("خطا در خواندن users.json:", e);
-    return [];
+// === Fail-fast: بدون این متغیرها سایت نباید بالا بیاید یا باید واضح هشدار بدهد ===
+const REQUIRED_ENV = ["DATABASE_URL"] as const;
+for (const key of REQUIRED_ENV) {
+  if (!process.env[key]) {
+    console.error(`❌ متغیر محیطی ${key} تنظیم نشده است. سرور اجرا نمی‌شود.`);
+    process.exit(1);
   }
 }
-
-function saveUsers(users: StoredUser[]) {
-  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-  fs.writeFileSync(USERS_FILE, JSON.stringify(users, null, 2), "utf-8");
+if (!process.env.GEMINI_API_KEY) {
+  console.warn("⚠️  GEMINI_API_KEY تنظیم نشده — مشاوره‌ی هوش مصنوعی کار نخواهد کرد.");
+}
+if (!process.env.GOOGLE_CLIENT_ID) {
+  console.warn("⚠️  GOOGLE_CLIENT_ID تنظیم نشده — ورود با گوگل غیرفعال خواهد بود.");
 }
 
-// کد تایید هر شماره موبایل: phone -> { code, expiresAt }
+// نشست‌های موقت OTP (فقط برای مرحله‌ی کوتاه ارسال/تایید کد، در حافظه کافی است)
 const otpStore = new Map<string, { code: string; expiresAt: number }>();
-
-// نشست‌های فعال: token -> userId  (جایگزین ساده به‌جای JWT واقعی)
-const sessions = new Map<string, string>();
 
 let ai: GoogleGenAI | null = null;
 function getAI() {
@@ -56,79 +56,115 @@ function getAI() {
   return ai;
 }
 
+const googleClient = process.env.GOOGLE_CLIENT_ID
+  ? new OAuth2Client(process.env.GOOGLE_CLIENT_ID)
+  : null;
+
 async function startServer() {
+  await initDb();
 
   const app = express();
   app.use(express.json());
 
-  // === Mock DB ===
-  const questions: any[] = [];
-  const responses: any[] = [];
-  const laws = [
-    { id: "1", title: "قانون مدیریت بحران کشور", category: "مدیریت بحران", description: "مصوب ۱۳۹۸، جهت سازماندهی و انسجام تیم‌های امدادی" },
-    { id: "2", title: "قانون بیمه همگانی", category: "حمایتی", description: "پوشش بیمه ای در برابر حوادث طبیعی مانند زلزله و سیل" }
-  ];
+  // === CORS ===
+  // در حالت عادی فرانت و بک روی یک دامنه‌اند؛ FRONTEND_ORIGIN فقط برای حالتی است
+  // که فرانت را جدا (مثلاً روی Vercel) میزبانی کنید.
+  const allowedOrigin = process.env.FRONTEND_ORIGIN;
+  app.use(
+    cors({
+      origin: allowedOrigin ? allowedOrigin : true,
+      credentials: true,
+    })
+  );
 
-  // === API ROUTES ===
-  
-  // Health
+  // === Rate limiting روی مسیرهای حساس/پرهزینه ===
+  const otpLimiter = rateLimit({
+    windowMs: 10 * 60 * 1000, // ۱۰ دقیقه
+    limit: 5,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: "تعداد درخواست‌های شما زیاد بوده، چند دقیقه دیگر دوباره تلاش کنید." },
+  });
+
+  const aiLimiter = rateLimit({
+    windowMs: 60 * 60 * 1000, // ۱ ساعت
+    limit: 30,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: "سقف تعداد درخواست‌های مشاوره‌ی هوش مصنوعی برای این ساعت پر شده است." },
+  });
+
+  const authLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    limit: 20,
+    standardHeaders: true,
+    legacyHeaders: false,
+  });
+
+  // === Auth middleware ===
+  interface AuthedRequest extends express.Request {
+    user?: DbUser;
+  }
+
+  async function requireAuth(req: AuthedRequest, res: express.Response, next: express.NextFunction) {
+    const header = req.headers.authorization ?? "";
+    const token = header.startsWith("Bearer ") ? header.slice(7) : null;
+    if (!token) return res.status(401).json({ error: "لطفاً ابتدا وارد حساب کاربری خود شوید." });
+
+    const user = await getUserBySessionToken(token);
+    if (!user) return res.status(401).json({ error: "نشست شما منقضی شده است، دوباره وارد شوید." });
+
+    req.user = user;
+    next();
+  }
+
+  // === Health ===
   app.get("/api/health", (req, res) => {
     res.json({ status: "ok" });
   });
 
-  // === Real Auth ===
-
-  // ثبت‌نام کاربر جدید
-  app.post("/api/auth/register", (req, res) => {
+  // === ثبت‌نام با شماره موبایل ===
+  app.post("/api/auth/register", authLimiter, async (req, res) => {
     const { firstName, lastName, nationalCode, phone } = req.body ?? {};
 
     if (!firstName?.trim() || !lastName?.trim() || !nationalCode?.trim() || !phone?.trim()) {
       return res.status(400).json({ error: "تکمیل تمام فیلدها الزامی است." });
     }
-    if (!/^\d{10}$/.test(nationalCode)) {
-      return res.status(400).json({ error: "کد ملی باید دقیقاً ۱۰ رقم باشد." });
+    if (!isValidIranianNationalCode(nationalCode)) {
+      return res.status(400).json({ error: "کد ملی وارد شده معتبر نیست." });
     }
     if (!/^09\d{9}$/.test(phone)) {
       return res.status(400).json({ error: "شماره موبایل معتبر نیست (مثال: 09123456789)." });
     }
 
-    const users = loadUsers();
-    if (users.some((u) => u.phone === phone)) {
+    if (await getUserByPhone(phone)) {
       return res.status(409).json({ error: "کاربری با این شماره موبایل قبلاً ثبت‌نام کرده است." });
     }
-    if (users.some((u) => u.nationalCode === nationalCode)) {
+    if (await getUserByNationalCode(nationalCode)) {
       return res.status(409).json({ error: "کاربری با این کد ملی قبلاً ثبت‌نام کرده است." });
     }
 
-    const user: StoredUser = {
-      id: crypto.randomUUID(),
+    const user = await insertUser({
       firstName: firstName.trim(),
       lastName: lastName.trim(),
       fullName: `${firstName.trim()} ${lastName.trim()}`,
       nationalCode,
       phone,
-      role: "Citizen",
-      createdAt: new Date().toISOString(),
-    };
+    });
 
-    users.push(user);
-    saveUsers(users);
-
-    const token = crypto.randomUUID();
-    sessions.set(token, user.id);
-
-    res.status(201).json({ token, user });
+    const token = await createSession(user.id);
+    res.status(201).json({ token, user: toPublicUser(user) });
   });
 
-  // مرحله ۱ ورود: ارسال کد تایید به کاربر ثبت‌نام‌شده
-  app.post("/api/auth/otp/send", (req, res) => {
+  // === ورود مرحله ۱: ارسال کد تایید ===
+  // توجه: چون سرویس پیامک واقعی وصل نیست، کد فعلاً فقط در لاگ سرور و (در dev) در پاسخ چاپ می‌شود.
+  app.post("/api/auth/otp/send", otpLimiter, async (req, res) => {
     const { phone } = req.body ?? {};
     if (!/^09\d{9}$/.test(phone ?? "")) {
       return res.status(400).json({ error: "شماره موبایل معتبر نیست." });
     }
 
-    const users = loadUsers();
-    const user = users.find((u) => u.phone === phone);
+    const user = await getUserByPhone(phone);
     if (!user) {
       return res.status(404).json({ error: "کاربری با این شماره موبایل یافت نشد. ابتدا ثبت‌نام کنید." });
     }
@@ -136,18 +172,17 @@ async function startServer() {
     const code = Math.floor(1000 + Math.random() * 9000).toString();
     otpStore.set(phone, { code, expiresAt: Date.now() + 2 * 60 * 1000 });
 
-    // TODO: این بخش باید در نسخه واقعی با یک سرویس پیامک (کاوه‌نگار، ملی‌پیامک و ...) جایگزین شود.
+    // TODO: این بخش باید در آینده با یک سرویس پیامک واقعی (کاوه‌نگار، ملی‌پیامک و ...) جایگزین شود.
     console.log(`[OTP] کد ورود برای ${phone}: ${code}`);
 
     res.json({
       ok: true,
-      // فقط در محیط توسعه، برای راحتی تست بدون سرویس پیامک واقعی
       devCode: process.env.NODE_ENV !== "production" ? code : undefined,
     });
   });
 
-  // مرحله ۲ ورود: بررسی کد و صدور نشست ورود
-  app.post("/api/auth/otp/verify", (req, res) => {
+  // === ورود مرحله ۲: بررسی کد ===
+  app.post("/api/auth/otp/verify", otpLimiter, async (req, res) => {
     const { phone, otp } = req.body ?? {};
     const entry = otpStore.get(phone);
 
@@ -159,26 +194,88 @@ async function startServer() {
     }
     otpStore.delete(phone);
 
-    const users = loadUsers();
-    const user = users.find((u) => u.phone === phone);
+    const user = await getUserByPhone(phone);
     if (!user) {
       return res.status(404).json({ error: "کاربری با این شماره موبایل یافت نشد." });
     }
 
-    const token = crypto.randomUUID();
-    sessions.set(token, user.id);
-    res.json({ token, user });
+    const token = await createSession(user.id);
+    res.json({ token, user: toPublicUser(user) });
   });
 
-  // Ask AI Question (Streaming SSE)
-  app.post("/api/ai/stream", async (req, res) => {
+  // === ورود/ثبت‌نام با گوگل ===
+  // فرانت با Google Identity Services یک id_token (credential) می‌گیرد و اینجا می‌فرستد.
+  app.post("/api/auth/google", authLimiter, async (req, res) => {
+    try {
+      if (!googleClient) {
+        return res.status(500).json({ error: "ورود با گوگل روی این سرور فعال نیست." });
+      }
+      const { credential } = req.body ?? {};
+      if (!credential) {
+        return res.status(400).json({ error: "توکن گوگل ارسال نشده است." });
+      }
+
+      const ticket = await googleClient.verifyIdToken({
+        idToken: credential,
+        audience: process.env.GOOGLE_CLIENT_ID,
+      });
+      const payload = ticket.getPayload();
+      if (!payload?.email) {
+        return res.status(400).json({ error: "دریافت ایمیل از حساب گوگل ممکن نشد." });
+      }
+
+      let user = (await getUserByGoogleId(payload.sub)) ?? (await getUserByEmail(payload.email));
+
+      if (!user) {
+        user = await insertUser({
+          firstName: payload.given_name ?? "",
+          lastName: payload.family_name ?? "",
+          fullName: payload.name ?? payload.email,
+          email: payload.email,
+          googleId: payload.sub,
+        });
+      } else if (!user.google_id) {
+        await linkGoogleId(user.id, payload.sub);
+      }
+
+      const token = await createSession(user.id);
+      res.json({ token, user: toPublicUser(user) });
+    } catch (e: any) {
+      console.error("خطای ورود با گوگل:", e.message);
+      res.status(401).json({ error: "احراز هویت گوگل ناموفق بود." });
+    }
+  });
+
+  // === اطلاعات کاربر لاگین‌شده ===
+  app.get("/api/me", requireAuth, (req: AuthedRequest, res) => {
+    res.json({ user: toPublicUser(req.user!) });
+  });
+
+  // === خروج ===
+  app.post("/api/auth/logout", requireAuth, async (req: AuthedRequest, res) => {
+    const header = req.headers.authorization ?? "";
+    const token = header.startsWith("Bearer ") ? header.slice(7) : null;
+    if (token) await deleteSession(token);
+    res.json({ ok: true });
+  });
+
+  // === تاریخچه‌ی سوالات/مشاوره‌های کاربر ===
+  app.get("/api/history", requireAuth, async (req: AuthedRequest, res) => {
+    const history = await getUserHistory(req.user!.id);
+    res.json({ history });
+  });
+
+  // === مشاوره‌ی هوش مصنوعی (Streaming SSE) — فقط برای کاربران واردشده ===
+  app.post("/api/ai/stream", requireAuth, aiLimiter, async (req: AuthedRequest, res) => {
     try {
       const { title, description } = req.body;
       if (!title || !description) return res.status(400).json({ error: "Title and description required" });
 
-      res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
-      res.setHeader('Cache-Control', 'no-cache');
-      res.setHeader('Connection', 'keep-alive');
+      const consultationId = await insertConsultation(req.user!.id, title, description);
+
+      res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+      res.setHeader("Cache-Control", "no-cache");
+      res.setHeader("Connection", "keep-alive");
 
       const prompt = `شما یک مشاور حقوقی رسمی، بسیار هوشمند و مودب هستید که در سامانه مدیریت بحران ایران فعالیت می‌کنید.
 یک شهروند متنی با عنوان "${title}" و توضیحات "${description}" ارسال کرده است.
@@ -204,15 +301,11 @@ async function startServer() {
       for await (const chunk of responseStream) {
         if (chunk.text) {
           fullText += chunk.text;
-          // Send piece to client
           res.write(`data: ${JSON.stringify({ text: chunk.text })}\n\n`);
         }
       }
 
-      // Save to mock db
-      const qId = Date.now().toString();
-      questions.push({ id: qId, title, description, createdAt: new Date().toISOString() });
-      responses.push({ id: `resp_${qId}`, questionId: qId, content: fullText, createdAt: new Date().toISOString() });
+      await saveConsultationResponse(consultationId, fullText);
 
       res.write(`data: [DONE]\n\n`);
       res.end();
@@ -223,7 +316,11 @@ async function startServer() {
     }
   });
 
-  // Laws API
+  // === Laws (public reference data) ===
+  const laws = [
+    { id: "1", title: "قانون مدیریت بحران کشور", category: "مدیریت بحران", description: "مصوب ۱۳۹۸، جهت سازماندهی و انسجام تیم‌های امدادی" },
+    { id: "2", title: "قانون بیمه همگانی", category: "حمایتی", description: "پوشش بیمه ای در برابر حوادث طبیعی مانند زلزله و سیل" },
+  ];
   app.get("/api/laws", (req, res) => {
     res.json(laws);
   });
@@ -236,15 +333,15 @@ async function startServer() {
     });
     app.use(vite.middlewares);
   } else {
-    const distPath = path.join(process.cwd(), 'dist');
+    const distPath = path.join(process.cwd(), "dist");
     app.use(express.static(distPath));
-    app.get('*', (req, res) => {
-      res.sendFile(path.join(distPath, 'index.html'));
+    app.get("*", (req, res) => {
+      res.sendFile(path.join(distPath, "index.html"));
     });
   }
 
   app.listen(PORT, "0.0.0.0", () => {
-    console.log(`Server running on port ${PORT}`);
+    console.log(`✅ Server running on port ${PORT}`);
   });
 }
 
