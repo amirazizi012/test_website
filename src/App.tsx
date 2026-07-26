@@ -7,6 +7,7 @@ import SupportCenters from "./pages/SupportCenters";
 import DamageClaim from "./pages/DamageClaim";
 import CrisisLaws from "./pages/CrisisLaws";
 import CrisisReports from "./pages/CrisisReports";
+import AdminPanel from "./pages/AdminPanel";
 
 const router = createBrowserRouter([
   {
@@ -40,6 +41,10 @@ const router = createBrowserRouter([
   {
     path: "/dashboard/reports",
     element: <CrisisReports />,
+  },
+  {
+    path: "/admin",
+    element: <AdminPanel />,
   }
 ]);
 
