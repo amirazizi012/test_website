@@ -1,271 +1,287 @@
-import { Pool } from "pg";
+import pg from "pg";
 import crypto from "crypto";
 
-const connectionString = process.env.DATABASE_URL;
+const { Pool } = pg;
 
-if (!connectionString) {
-  // fail-fast: به‌جای اینکه بعداً و بی‌سروصدا خراب شود، همین اول با پیام واضح متوقف می‌شویم
-  throw new Error(
-    "DATABASE_URL تنظیم نشده است. یک دیتابیس Postgres رایگان (مثلاً از neon.tech) بسازید " +
-    "و connection string آن را در متغیر محیطی DATABASE_URL قرار دهید."
-  );
+let pool: InstanceType<typeof Pool> | null = null;
+
+export function getPool() {
+  if (!pool) {
+    const connectionString = process.env.DATABASE_URL;
+    if (!connectionString) {
+      throw new Error(
+        "DATABASE_URL تنظیم نشده است. یک دیتابیس Postgres بسازید (مثلاً از داشبورد Render → New → PostgreSQL، رایگان) و آدرس اتصالش را در متغیر محیطی DATABASE_URL قرار دهید."
+      );
+    }
+    pool = new Pool({
+      connectionString,
+      // اکثر سرویس‌های Postgres ابری (از جمله Render) نیاز به SSL دارند؛
+      // برای دیتابیس لوکال (localhost) نیازی به SSL نیست.
+      ssl: connectionString.includes("localhost") ? false : { rejectUnauthorized: false },
+    });
+  }
+  return pool;
 }
 
-export const pool = new Pool({
-  connectionString,
-  ssl: { rejectUnauthorized: false }, // برای Neon/Render لازم است
-});
-
-export interface DbUser {
-  id: string;
-  first_name: string | null;
-  last_name: string | null;
-  full_name: string;
-  national_code: string | null;
-  phone: string | null;
-  email: string | null;
-  google_id: string | null;
-  role: string;
-  created_at: string;
-}
-
-export interface PublicUser {
-  id: string;
-  firstName: string;
-  lastName: string;
-  fullName: string;
-  nationalCode: string | null;
-  phone: string | null;
-  email: string | null;
-  role: string;
-  createdAt: string;
-}
-
-export function toPublicUser(u: DbUser): PublicUser {
-  return {
-    id: u.id,
-    firstName: u.first_name ?? "",
-    lastName: u.last_name ?? "",
-    fullName: u.full_name,
-    nationalCode: u.national_code,
-    phone: u.phone,
-    email: u.email,
-    role: u.role,
-    createdAt: u.created_at,
-  };
-}
-
-// === راه‌اندازی جدول‌ها (idempotent - هر بار سرور بالا می‌آید اجرا می‌شود) ===
+/** ساخت جداول در صورت نبود — بی‌خطر برای اجرای مکرر (هر بار سرور بالا می‌آید صدا زده می‌شود) */
 export async function initDb() {
-  await pool.query(`
+  const p = getPool();
+
+  await p.query(`
     CREATE TABLE IF NOT EXISTS users (
-      id UUID PRIMARY KEY,
-      first_name TEXT,
-      last_name TEXT,
+      id TEXT PRIMARY KEY,
+      first_name TEXT NOT NULL,
+      last_name TEXT NOT NULL,
       full_name TEXT NOT NULL,
-      national_code TEXT UNIQUE,
-      phone TEXT UNIQUE,
-      email TEXT UNIQUE,
-      google_id TEXT UNIQUE,
+      national_code TEXT UNIQUE NOT NULL,
+      phone TEXT UNIQUE NOT NULL,
       role TEXT NOT NULL DEFAULT 'Citizen',
       created_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
   `);
 
-  await pool.query(`
+  await p.query(`
     CREATE TABLE IF NOT EXISTS sessions (
-      token UUID PRIMARY KEY,
-      user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-      expires_at TIMESTAMPTZ NOT NULL
-    );
-  `);
-
-  // تاریخچه‌ی هر سوال/درخواست مشاوره‌ی کاربر + پاسخ AI، برای همیشه نگه داشته می‌شود
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS consultations (
-      id UUID PRIMARY KEY,
-      user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      title TEXT NOT NULL,
-      description TEXT NOT NULL,
-      response TEXT,
+      token TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
       created_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
   `);
 
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_consultations_user ON consultations(user_id, created_at DESC);`);
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);`);
-}
-
-// === Admin: users + activity overview ===
-
-export interface UserWithStats extends DbUser {
-  consultation_count: string; // pg برمی‌گرداند COUNT() به شکل رشته
-}
-
-export async function getAllUsersWithStats(): Promise<UserWithStats[]> {
-  const r = await pool.query(`
-    SELECT u.*, COUNT(c.id) AS consultation_count
-    FROM users u
-    LEFT JOIN consultations c ON c.user_id = u.id
-    GROUP BY u.id
-    ORDER BY u.created_at DESC
+  await p.query(`
+    CREATE TABLE IF NOT EXISTS admin_sessions (
+      token TEXT PRIMARY KEY,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
   `);
-  return r.rows;
+
+  await p.query(`
+    CREATE TABLE IF NOT EXISTS admin_config (
+      id INT PRIMARY KEY DEFAULT 1,
+      password_hash TEXT NOT NULL,
+      is_default BOOLEAN NOT NULL DEFAULT true
+    );
+  `);
+
+  await p.query(`
+    CREATE TABLE IF NOT EXISTS laws (
+      id TEXT PRIMARY KEY,
+      title TEXT NOT NULL,
+      category TEXT NOT NULL,
+      description TEXT NOT NULL
+    );
+  `);
+
+  await p.query(`
+    CREATE TABLE IF NOT EXISTS questions (
+      id TEXT PRIMARY KEY,
+      title TEXT NOT NULL,
+      description TEXT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
+
+  await p.query(`
+    CREATE TABLE IF NOT EXISTS responses (
+      id TEXT PRIMARY KEY,
+      question_id TEXT NOT NULL REFERENCES questions(id) ON DELETE CASCADE,
+      content TEXT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
 }
 
-export interface ConsultationWithUser {
+// ==================== Users ====================
+
+export interface StoredUser {
   id: string;
-  full_name: string;
-  phone: string | null;
-  national_code: string | null;
-  title: string;
-  description: string;
-  response: string | null;
-  created_at: string;
-}
-
-export async function getAllConsultationsWithUser(): Promise<ConsultationWithUser[]> {
-  const r = await pool.query(`
-    SELECT c.id, u.full_name, u.phone, u.national_code,
-           c.title, c.description, c.response, c.created_at
-    FROM consultations c
-    JOIN users u ON u.id = c.user_id
-    ORDER BY c.created_at DESC
-  `);
-  return r.rows;
-}
-
-export interface AdminStats {
-  totalUsers: string;
-  totalConsultations: string;
-  usersLast7Days: string;
-  consultationsLast7Days: string;
-}
-
-export async function getAdminStats(): Promise<AdminStats> {
-  const r = await pool.query(`
-    SELECT
-      (SELECT COUNT(*) FROM users) AS "totalUsers",
-      (SELECT COUNT(*) FROM consultations) AS "totalConsultations",
-      (SELECT COUNT(*) FROM users WHERE created_at > now() - interval '7 days') AS "usersLast7Days",
-      (SELECT COUNT(*) FROM consultations WHERE created_at > now() - interval '7 days') AS "consultationsLast7Days"
-  `);
-  return r.rows[0];
-}
-
-// === Users ===
-
-export async function getUserByPhone(phone: string): Promise<DbUser | null> {
-  const r = await pool.query("SELECT * FROM users WHERE phone = $1", [phone]);
-  return r.rows[0] ?? null;
-}
-
-export async function getUserByNationalCode(code: string): Promise<DbUser | null> {
-  const r = await pool.query("SELECT * FROM users WHERE national_code = $1", [code]);
-  return r.rows[0] ?? null;
-}
-
-export async function getUserByEmail(email: string): Promise<DbUser | null> {
-  const r = await pool.query("SELECT * FROM users WHERE email = $1", [email]);
-  return r.rows[0] ?? null;
-}
-
-export async function getUserByGoogleId(googleId: string): Promise<DbUser | null> {
-  const r = await pool.query("SELECT * FROM users WHERE google_id = $1", [googleId]);
-  return r.rows[0] ?? null;
-}
-
-export async function getUserById(id: string): Promise<DbUser | null> {
-  const r = await pool.query("SELECT * FROM users WHERE id = $1", [id]);
-  return r.rows[0] ?? null;
-}
-
-export async function insertUser(data: {
-  firstName?: string | null;
-  lastName?: string | null;
+  firstName: string;
+  lastName: string;
   fullName: string;
-  nationalCode?: string | null;
-  phone?: string | null;
-  email?: string | null;
-  googleId?: string | null;
-}): Promise<DbUser> {
-  const id = crypto.randomUUID();
-  const r = await pool.query(
-    `INSERT INTO users (id, first_name, last_name, full_name, national_code, phone, email, google_id)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
-    [
-      id,
-      data.firstName ?? null,
-      data.lastName ?? null,
-      data.fullName,
-      data.nationalCode ?? null,
-      data.phone ?? null,
-      data.email ?? null,
-      data.googleId ?? null,
-    ]
+  nationalCode: string;
+  phone: string;
+  role: "Citizen";
+  createdAt: string;
+}
+
+function rowToUser(row: any): StoredUser {
+  return {
+    id: row.id,
+    firstName: row.first_name,
+    lastName: row.last_name,
+    fullName: row.full_name,
+    nationalCode: row.national_code,
+    phone: row.phone,
+    role: row.role,
+    createdAt: row.created_at instanceof Date ? row.created_at.toISOString() : row.created_at,
+  };
+}
+
+export async function findUserByPhone(phone: string): Promise<StoredUser | null> {
+  const { rows } = await getPool().query("SELECT * FROM users WHERE phone = $1", [phone]);
+  return rows[0] ? rowToUser(rows[0]) : null;
+}
+
+export async function findUserByNationalCode(nationalCode: string): Promise<StoredUser | null> {
+  const { rows } = await getPool().query("SELECT * FROM users WHERE national_code = $1", [nationalCode]);
+  return rows[0] ? rowToUser(rows[0]) : null;
+}
+
+export async function insertUser(user: StoredUser): Promise<void> {
+  await getPool().query(
+    `INSERT INTO users (id, first_name, last_name, full_name, national_code, phone, role, created_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+    [user.id, user.firstName, user.lastName, user.fullName, user.nationalCode, user.phone, user.role, user.createdAt]
   );
-  return r.rows[0];
 }
 
-export async function linkGoogleId(userId: string, googleId: string) {
-  await pool.query("UPDATE users SET google_id = $1 WHERE id = $2", [googleId, userId]);
+export async function getAllUsers(): Promise<StoredUser[]> {
+  const { rows } = await getPool().query("SELECT * FROM users ORDER BY created_at DESC");
+  return rows.map(rowToUser);
 }
 
-export async function setUserRole(userId: string, role: string) {
-  await pool.query("UPDATE users SET role = $1 WHERE id = $2", [role, userId]);
+export async function countUsers(): Promise<number> {
+  const { rows } = await getPool().query("SELECT COUNT(*)::int AS count FROM users");
+  return rows[0].count;
 }
 
-// === Sessions ===
-
-const SESSION_TTL_DAYS = 30;
+// ==================== Sessions (شهروندان) ====================
 
 export async function createSession(userId: string): Promise<string> {
   const token = crypto.randomUUID();
-  const expiresAt = new Date(Date.now() + SESSION_TTL_DAYS * 24 * 60 * 60 * 1000);
-  await pool.query("INSERT INTO sessions (token, user_id, expires_at) VALUES ($1,$2,$3)", [
-    token,
-    userId,
-    expiresAt,
-  ]);
+  await getPool().query("INSERT INTO sessions (token, user_id) VALUES ($1, $2)", [token, userId]);
   return token;
 }
 
-export async function getUserBySessionToken(token: string): Promise<DbUser | null> {
-  const r = await pool.query(
-    `SELECT u.* FROM sessions s
-     JOIN users u ON u.id = s.user_id
-     WHERE s.token = $1 AND s.expires_at > now()`,
-    [token]
+export async function getSessionUserId(token: string): Promise<string | null> {
+  const { rows } = await getPool().query("SELECT user_id FROM sessions WHERE token = $1", [token]);
+  return rows[0]?.user_id ?? null;
+}
+
+// ==================== Admin ====================
+
+export async function createAdminSession(): Promise<string> {
+  const token = crypto.randomUUID();
+  await getPool().query("INSERT INTO admin_sessions (token) VALUES ($1)", [token]);
+  return token;
+}
+
+export async function isValidAdminSession(token: string): Promise<boolean> {
+  const { rows } = await getPool().query("SELECT 1 FROM admin_sessions WHERE token = $1", [token]);
+  return rows.length > 0;
+}
+
+export function hashPassword(password: string): string {
+  const salt = crypto.randomBytes(16).toString("hex");
+  const hash = crypto.scryptSync(password, salt, 64).toString("hex");
+  return `${salt}:${hash}`;
+}
+
+export function verifyPassword(password: string, stored: string): boolean {
+  const [salt, hash] = (stored ?? "").split(":");
+  if (!salt || !hash) return false;
+  const hashVerify = crypto.scryptSync(password, salt, 64).toString("hex");
+  const a = Buffer.from(hash, "hex");
+  const b = Buffer.from(hashVerify, "hex");
+  if (a.length !== b.length) return false;
+  return crypto.timingSafeEqual(a, b);
+}
+
+export async function getAdminConfig(): Promise<{ passwordHash: string; isDefault: boolean }> {
+  const { rows } = await getPool().query("SELECT * FROM admin_config WHERE id = 1");
+  if (rows.length === 0) {
+    const passwordHash = hashPassword("ADMIN");
+    await getPool().query(
+      "INSERT INTO admin_config (id, password_hash, is_default) VALUES (1, $1, true)",
+      [passwordHash]
+    );
+    return { passwordHash, isDefault: true };
+  }
+  return { passwordHash: rows[0].password_hash, isDefault: rows[0].is_default };
+}
+
+export async function updateAdminConfig(passwordHash: string, isDefault: boolean): Promise<void> {
+  await getPool().query(
+    `INSERT INTO admin_config (id, password_hash, is_default) VALUES (1, $1, $2)
+     ON CONFLICT (id) DO UPDATE SET password_hash = $1, is_default = $2`,
+    [passwordHash, isDefault]
   );
-  return r.rows[0] ?? null;
 }
 
-export async function deleteSession(token: string) {
-  await pool.query("DELETE FROM sessions WHERE token = $1", [token]);
+// ==================== Laws ====================
+
+export interface CrisisLawEntry {
+  id: string;
+  title: string;
+  category: string;
+  description: string;
 }
 
-// === Consultations (تاریخچه‌ی چت/مشاوره) ===
+export async function getAllLaws(): Promise<CrisisLawEntry[]> {
+  const { rows } = await getPool().query("SELECT id, title, category, description FROM laws ORDER BY category, title");
+  return rows;
+}
 
-export async function insertConsultation(userId: string, title: string, description: string): Promise<string> {
-  const id = crypto.randomUUID();
-  await pool.query(
-    "INSERT INTO consultations (id, user_id, title, description) VALUES ($1,$2,$3,$4)",
-    [id, userId, title, description]
+export async function seedLawsIfEmpty(defaults: CrisisLawEntry[]): Promise<void> {
+  const { rows } = await getPool().query("SELECT COUNT(*)::int AS count FROM laws");
+  if (rows[0].count === 0) {
+    for (const law of defaults) {
+      await getPool().query(
+        "INSERT INTO laws (id, title, category, description) VALUES ($1, $2, $3, $4) ON CONFLICT (id) DO NOTHING",
+        [law.id, law.title, law.category, law.description]
+      );
+    }
+  }
+}
+
+export async function insertLaw(law: CrisisLawEntry): Promise<void> {
+  await getPool().query(
+    "INSERT INTO laws (id, title, category, description) VALUES ($1, $2, $3, $4)",
+    [law.id, law.title, law.category, law.description]
   );
-  return id;
 }
 
-export async function saveConsultationResponse(id: string, response: string) {
-  await pool.query("UPDATE consultations SET response = $1 WHERE id = $2", [response, id]);
-}
-
-export async function getUserHistory(userId: string, limit = 50) {
-  const r = await pool.query(
-    `SELECT id, title, description, response, created_at
-     FROM consultations WHERE user_id = $1
-     ORDER BY created_at DESC LIMIT $2`,
-    [userId, limit]
+export async function updateLaw(id: string, fields: Partial<Omit<CrisisLawEntry, "id">>): Promise<CrisisLawEntry | null> {
+  const existing = await getPool().query("SELECT * FROM laws WHERE id = $1", [id]);
+  if (existing.rows.length === 0) return null;
+  const current = existing.rows[0];
+  const title = fields.title ?? current.title;
+  const category = fields.category ?? current.category;
+  const description = fields.description ?? current.description;
+  await getPool().query(
+    "UPDATE laws SET title = $1, category = $2, description = $3 WHERE id = $4",
+    [title, category, description, id]
   );
-  return r.rows;
+  return { id, title, category, description };
+}
+
+export async function deleteLaw(id: string): Promise<boolean> {
+  const result = await getPool().query("DELETE FROM laws WHERE id = $1", [id]);
+  return (result.rowCount ?? 0) > 0;
+}
+
+export async function countLaws(): Promise<number> {
+  const { rows } = await getPool().query("SELECT COUNT(*)::int AS count FROM laws");
+  return rows[0].count;
+}
+
+// ==================== Questions / Responses (تاریخچه چت) ====================
+
+export async function insertQuestion(q: { id: string; title: string; description: string }): Promise<void> {
+  await getPool().query(
+    "INSERT INTO questions (id, title, description) VALUES ($1, $2, $3)",
+    [q.id, q.title, q.description]
+  );
+}
+
+export async function insertResponse(r: { id: string; questionId: string; content: string }): Promise<void> {
+  await getPool().query(
+    "INSERT INTO responses (id, question_id, content) VALUES ($1, $2, $3)",
+    [r.id, r.questionId, r.content]
+  );
+}
+
+export async function countQuestions(): Promise<number> {
+  const { rows } = await getPool().query("SELECT COUNT(*)::int AS count FROM questions");
+  return rows[0].count;
 }

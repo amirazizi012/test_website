@@ -1,54 +1,58 @@
 import "dotenv/config";
 import express from "express";
-import cors from "cors";
+import type { Request, Response, NextFunction } from "express";
 import path from "path";
-import rateLimit from "express-rate-limit";
+import crypto from "crypto";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI } from "@google/genai";
-import { OAuth2Client } from "google-auth-library";
-
-import { isValidIranianNationalCode } from "./nationalId";
 import {
   initDb,
-  getUserByPhone,
-  getUserByNationalCode,
-  getUserByEmail,
-  getUserByGoogleId,
+  findUserByPhone,
+  findUserByNationalCode,
   insertUser,
-  linkGoogleId,
+  getAllUsers,
+  countUsers,
   createSession,
-  getUserBySessionToken,
-  deleteSession,
-  insertConsultation,
-  saveConsultationResponse,
-  getUserHistory,
-  getAllUsersWithStats,
-  getAllConsultationsWithUser,
-  getAdminStats,
-  setUserRole,
-  toPublicUser,
-  type DbUser,
+  createAdminSession,
+  isValidAdminSession,
+  hashPassword,
+  verifyPassword,
+  getAdminConfig,
+  updateAdminConfig,
+  getAllLaws,
+  seedLawsIfEmpty,
+  insertLaw,
+  updateLaw,
+  deleteLaw,
+  countLaws,
+  insertQuestion,
+  insertResponse,
+  countQuestions,
+  type StoredUser,
+  type CrisisLawEntry,
 } from "./db";
 
-const PORT = Number(process.env.PORT) || 3000;
+const PORT = 3000;
 
-// === Fail-fast: بدون این متغیرها سایت نباید بالا بیاید یا باید واضح هشدار بدهد ===
-const REQUIRED_ENV = ["DATABASE_URL"] as const;
-for (const key of REQUIRED_ENV) {
-  if (!process.env[key]) {
-    console.error(`❌ متغیر محیطی ${key} تنظیم نشده است. سرور اجرا نمی‌شود.`);
-    process.exit(1);
+// کد تایید هر شماره موبایل: phone -> { code, expiresAt } — کوتاه‌مدت است، در حافظه کافیست
+const otpStore = new Map<string, { code: string; expiresAt: number }>();
+
+// جلوگیری ساده از حدس‌زدن رمز مدیر: بعد از ۵ تلاش ناموفق، ۵ دقیقه قفل
+const adminLoginAttempts = new Map<string, { count: number; lockedUntil: number }>();
+
+async function authenticateAdmin(req: Request, res: Response, next: NextFunction) {
+  try {
+    const header = req.headers.authorization;
+    const token = header?.startsWith("Bearer ") ? header.slice(7) : null;
+    if (!token || !(await isValidAdminSession(token))) {
+      return res.status(401).json({ error: "دسترسی غیرمجاز. لطفاً وارد پنل مدیریت شوید." });
+    }
+    next();
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "خطای داخلی سرور." });
   }
 }
-if (!process.env.GEMINI_API_KEY) {
-  console.warn("⚠️  GEMINI_API_KEY تنظیم نشده — مشاوره‌ی هوش مصنوعی کار نخواهد کرد.");
-}
-if (!process.env.GOOGLE_CLIENT_ID) {
-  console.warn("⚠️  GOOGLE_CLIENT_ID تنظیم نشده — ورود با گوگل غیرفعال خواهد بود.");
-}
-
-// نشست‌های موقت OTP (فقط برای مرحله‌ی کوتاه ارسال/تایید کد، در حافظه کافی است)
-const otpStore = new Map<string, { code: string; expiresAt: number }>();
 
 let ai: GoogleGenAI | null = null;
 function getAI() {
@@ -60,295 +64,288 @@ function getAI() {
   return ai;
 }
 
-const googleClient = process.env.GOOGLE_CLIENT_ID
-  ? new OAuth2Client(process.env.GOOGLE_CLIENT_ID)
-  : null;
-
-// شماره‌موبایل‌ها/ایمیل‌هایی که در این متغیرهای محیطی باشند، خودکار نقش Admin می‌گیرند.
-// مثال در .env: ADMIN_PHONES=09121234567,09359999999
-const adminPhones = (process.env.ADMIN_PHONES ?? "")
-  .split(",").map((s) => s.trim()).filter(Boolean);
-const adminEmails = (process.env.ADMIN_EMAILS ?? "")
-  .split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
-
-async function ensureAdminRole(user: DbUser): Promise<DbUser> {
-  const shouldBeAdmin =
-    (!!user.phone && adminPhones.includes(user.phone)) ||
-    (!!user.email && adminEmails.includes(user.email.toLowerCase()));
-
-  if (shouldBeAdmin && user.role !== "Admin") {
-    await setUserRole(user.id, "Admin");
-    return { ...user, role: "Admin" };
-  }
-  return user;
-}
+// ⚠️ فهرست شروع (starter) قوانین. عناوین واقعی‌اند، اما شرح‌ها خلاصه و کلی‌اند
+// و شماره‌ی ماده/تبصره‌ی دقیق ندارند. پیش از تکیه‌ی واقعی شهروندان در شرایط
+// بحران/جنگ، این فهرست باید توسط یک وکیل یا کارشناس حقوقی بازبینی و تکمیل شود.
+const DEFAULT_LAWS: CrisisLawEntry[] = [
+  { id: "1", title: "قانون مدیریت بحران کشور", category: "مدیریت بحران", description: "چارچوب سازماندهی، فرماندهی واحد و هماهنگی دستگاه‌های اجرایی و امدادی کشور پیش، حین و پس از بحران‌های طبیعی و غیرطبیعی از جمله جنگ." },
+  { id: "2", title: "قانون بیمه همگانی حوادث طبیعی", category: "حمایتی", description: "پوشش بیمه‌ای در برابر خسارات ناشی از حوادث طبیعی مانند زلزله و سیل برای اموال و مسکن شهروندان؛ نحوه‌ی مطالبه‌ی غرامت از صندوق بیمه." },
+  { id: "3", title: "آیین‌نامه کمک‌های بلاعوض بازسازی مسکن", category: "مسکن", description: "شرایط دریافت وام قرض‌الحسنه و کمک بلاعوض از بنیاد مسکن انقلاب اسلامی برای بازسازی یا نوسازی منازل مسکونی آسیب‌دیده در اثر جنگ یا بلایای طبیعی." },
+  { id: "4", title: "قانون مسئولیت مدنی", category: "مسئولیت مدنی", description: "اصول کلی جبران خسارت وارده به اشخاص یا اموال آن‌ها در نتیجه‌ی فعل یا ترک فعل دیگری، از جمله در مواردی که یک نهاد دولتی مسبب شناخته شود." },
+  { id: "5", title: "قانون کار در شرایط اضطراری و تعطیلی اجباری", category: "کار و اشتغال", description: "حقوق کارگران و کارفرمایان هنگام تعطیلی اجباری کسب‌وکار به دلیل جنگ یا بحران، از جمله پرداخت حقوق ایام تعطیلی و بیمه بیکاری." },
+  { id: "6", title: "دستورالعمل کمک‌رسانی هلال‌احمر و اورژانس", category: "امداد و نجات", description: "نحوه‌ی درخواست کمک فوری پزشکی، تخلیه‌ی اضطراری و اسکان موقت آسیب‌دیدگان جنگ و بلایای طبیعی." },
+  { id: "7", title: "قانون حمایت از خانواده شهدا، جانبازان و ایثارگران", category: "حمایتی", description: "مزایا و خدمات حمایتی (درمانی، مسکن، اشتغال) قابل ارائه به خانواده‌های آسیب‌دیده از جنگ از طریق بنیاد شهید و امور ایثارگران." },
+  { id: "8", title: "قانون بیمه اجتماعی رانندگان و بیمه شخص ثالث", category: "بیمه", description: "پوشش خسارات جانی و مالی ناشی از حوادث رانندگی در شرایط بحرانی، و نحوه‌ی مطالبه از شرکت بیمه یا صندوق تأمین خسارات بدنی." },
+  { id: "9", title: "قانون تسهیلات اعطایی بانک‌ها به آسیب‌دیدگان بحران", category: "بانکی", description: "شرایط تنفس بازپرداخت اقساط، تسهیلات ارزان‌قیمت و بخشودگی جرائم دیرکرد برای وام‌گیرندگانی که در جنگ یا بلایای طبیعی آسیب دیده‌اند." },
+  { id: "10", title: "قانون حمایت از کسب‌وکارهای آسیب‌دیده از بحران", category: "کسب‌وکار", description: "معافیت‌های مالیاتی موقت، تسهیلات بازسازی و مشوق‌های بیمه‌ای برای اصناف و کسب‌وکارهای کوچکی که در اثر جنگ یا بحران دچار خسارت شده‌اند." },
+  { id: "11", title: "قانون خدمات درمانی رایگان در مناطق جنگی", category: "بهداشت و درمان", description: "الزام بیمارستان‌های دولتی و خصوصی به ارائه‌ی خدمات درمانی اضطراری رایگان یا با تعرفه‌ی کاهش‌یافته به آسیب‌دیدگان مناطق بحران‌زده." },
+  { id: "12", title: "آیین‌نامه حمایت از کودکان بی‌سرپرست ناشی از بحران", category: "حقوق کودک", description: "روند سرپرستی موقت، ثبت هویت و دسترسی به آموزش رایگان برای کودکانی که در جنگ یا بلایای طبیعی سرپرست خود را از دست داده‌اند." },
+  { id: "13", title: "قانون حمایت از سالمندان و معلولان در شرایط بحرانی", category: "حمایتی", description: "اولویت‌بندی در تخلیه‌ی اضطراری، اسکان موقت و دریافت خدمات پزشکی برای سالمندان و افراد دارای معلولیت." },
+  { id: "14", title: "قانون معافیت مالیاتی اموال آسیب‌دیده از جنگ", category: "مالیات", description: "معافیت یا تخفیف مالیات بر اموال و املاکی که در اثر جنگ یا بلایای طبیعی تخریب یا نیمه‌تخریب شده‌اند." },
+  { id: "15", title: "آیین‌نامه اسکان اضطراری و مدیریت کمپ‌های موقت", category: "امداد و نجات", description: "استانداردهای حداقلی برای اسکان موقت آسیب‌دیدگان جنگ، شامل امکانات بهداشتی، غذایی و ایمنی در کمپ‌های اضطراری." },
+  { id: "16", title: "قانون حفاظت از اماکن آموزشی در شرایط جنگی", category: "آموزش", description: "الزامات ایمن‌سازی مدارس، جابه‌جایی موقت کلاس‌ها و ادامه‌ی روند تحصیل دانش‌آموزان در مناطق درگیر بحران." },
+  { id: "17", title: "قانون نقل و انتقال و ترافیک در شرایط اضطراری", category: "حمل و نقل", description: "اختیارات ستاد بحران برای محدودسازی موقت تردد، اولویت‌دهی به خودروهای امدادی و مدیریت مسیرهای تخلیه‌ی اضطراری." },
+  { id: "18", title: "قانون اطلاع‌رسانی و رسانه در شرایط بحران", category: "رسانه", description: "الزام رسانه‌های رسمی به اطلاع‌رسانی شفاف و به‌موقع درباره‌ی وضعیت بحران، و ممنوعیت انتشار اخبار نادرست که موجب هراس عمومی شود." },
+  { id: "19", title: "قانون خدمت وظیفه عمومی در شرایط جنگی", category: "نظامی", description: "مقررات مربوط به فراخوان نیروهای ذخیره، معافیت‌های موقت خدمت و حقوق خانواده‌های افرادی که به خدمت اعزام می‌شوند." },
+  { id: "20", title: "قانون حمایت از آسیب‌دیدگان محیط‌زیستی ناشی از بحران", category: "محیط زیست", description: "جبران خسارات زیست‌محیطی (مانند آلودگی آب و خاک) ناشی از حملات یا حوادث بحرانی، و الزام دستگاه‌های مسئول به پاک‌سازی و بازتوانی محیط." },
+];
 
 async function startServer() {
   await initDb();
+  await seedLawsIfEmpty(DEFAULT_LAWS);
 
   const app = express();
-  app.set("trust proxy", 1); // لازم برای اینکه express-rate-limit پشت پراکسی Render درست کار کند
+
+  // Render (مثل هر PaaS دیگه) اپ شما را پشت یک reverse proxy اجرا می‌کند.
+  app.set("trust proxy", 1);
+
   app.use(express.json());
 
-  // === CORS ===
-  // در حالت عادی فرانت و بک روی یک دامنه‌اند؛ FRONTEND_ORIGIN فقط برای حالتی است
-  // که فرانت را جدا (مثلاً روی Vercel) میزبانی کنید.
-  const allowedOrigin = process.env.FRONTEND_ORIGIN;
-  app.use(
-    cors({
-      origin: allowedOrigin ? allowedOrigin : true,
-      credentials: true,
-    })
-  );
+  // === API ROUTES ===
 
-  // === Rate limiting روی مسیرهای حساس/پرهزینه ===
-  const otpLimiter = rateLimit({
-    windowMs: 10 * 60 * 1000, // ۱۰ دقیقه
-    limit: 5,
-    standardHeaders: true,
-    legacyHeaders: false,
-    message: { error: "تعداد درخواست‌های شما زیاد بوده، چند دقیقه دیگر دوباره تلاش کنید." },
-  });
-
-  const aiLimiter = rateLimit({
-    windowMs: 60 * 60 * 1000, // ۱ ساعت
-    limit: 30,
-    standardHeaders: true,
-    legacyHeaders: false,
-    message: { error: "سقف تعداد درخواست‌های مشاوره‌ی هوش مصنوعی برای این ساعت پر شده است." },
-  });
-
-  const authLimiter = rateLimit({
-    windowMs: 15 * 60 * 1000,
-    limit: 20,
-    standardHeaders: true,
-    legacyHeaders: false,
-  });
-
-  // === Auth middleware ===
-  interface AuthedRequest extends express.Request {
-    user?: DbUser;
-  }
-
-  async function requireAuth(req: AuthedRequest, res: express.Response, next: express.NextFunction) {
-    const header = req.headers.authorization ?? "";
-    const token = header.startsWith("Bearer ") ? header.slice(7) : null;
-    if (!token) return res.status(401).json({ error: "لطفاً ابتدا وارد حساب کاربری خود شوید." });
-
-    const user = await getUserBySessionToken(token);
-    if (!user) return res.status(401).json({ error: "نشست شما منقضی شده است، دوباره وارد شوید." });
-
-    req.user = user;
-    next();
-  }
-
-  async function requireAdmin(req: AuthedRequest, res: express.Response, next: express.NextFunction) {
-    if (!req.user || req.user.role !== "Admin") {
-      return res.status(403).json({ error: "دسترسی فقط برای مدیر سامانه مجاز است." });
-    }
-    next();
-  }
-
-  // === Health ===
   app.get("/api/health", (req, res) => {
     res.json({ status: "ok" });
   });
 
-  // === ثبت‌نام با شماره موبایل ===
-  app.post("/api/auth/register", authLimiter, async (req, res) => {
-    const { firstName, lastName, nationalCode, phone } = req.body ?? {};
+  // ==================== احراز هویت شهروندان — بدون هیچ تغییری در منطق ====================
 
-    if (!firstName?.trim() || !lastName?.trim() || !nationalCode?.trim() || !phone?.trim()) {
-      return res.status(400).json({ error: "تکمیل تمام فیلدها الزامی است." });
-    }
-    if (!isValidIranianNationalCode(nationalCode)) {
-      return res.status(400).json({ error: "کد ملی وارد شده معتبر نیست." });
-    }
-    if (!/^09\d{9}$/.test(phone)) {
-      return res.status(400).json({ error: "شماره موبایل معتبر نیست (مثال: 09123456789)." });
-    }
-
-    if (await getUserByPhone(phone)) {
-      return res.status(409).json({ error: "کاربری با این شماره موبایل قبلاً ثبت‌نام کرده است." });
-    }
-    if (await getUserByNationalCode(nationalCode)) {
-      return res.status(409).json({ error: "کاربری با این کد ملی قبلاً ثبت‌نام کرده است." });
-    }
-
-    let user = await insertUser({
-      firstName: firstName.trim(),
-      lastName: lastName.trim(),
-      fullName: `${firstName.trim()} ${lastName.trim()}`,
-      nationalCode,
-      phone,
-    });
-    user = await ensureAdminRole(user);
-
-    const token = await createSession(user.id);
-    res.status(201).json({ token, user: toPublicUser(user) });
-  });
-
-  // === ورود مرحله ۱: ارسال کد تایید ===
-  // توجه: چون سرویس پیامک واقعی وصل نیست، کد فعلاً فقط در لاگ سرور و (در dev) در پاسخ چاپ می‌شود.
-  app.post("/api/auth/otp/send", otpLimiter, async (req, res) => {
-    const { phone } = req.body ?? {};
-    if (!/^09\d{9}$/.test(phone ?? "")) {
-      return res.status(400).json({ error: "شماره موبایل معتبر نیست." });
-    }
-
-    const user = await getUserByPhone(phone);
-    if (!user) {
-      return res.status(404).json({ error: "کاربری با این شماره موبایل یافت نشد. ابتدا ثبت‌نام کنید." });
-    }
-
-    const code = Math.floor(1000 + Math.random() * 9000).toString();
-    otpStore.set(phone, { code, expiresAt: Date.now() + 2 * 60 * 1000 });
-
-    // TODO: این بخش باید در آینده با یک سرویس پیامک واقعی (کاوه‌نگار، ملی‌پیامک و ...) جایگزین شود.
-    console.log(`[OTP] کد ورود برای ${phone}: ${code}`);
-
-    res.json({
-      ok: true,
-      devCode: process.env.NODE_ENV !== "production" ? code : undefined,
-    });
-  });
-
-  // === ورود مرحله ۲: بررسی کد ===
-  app.post("/api/auth/otp/verify", otpLimiter, async (req, res) => {
-    const { phone, otp } = req.body ?? {};
-    const entry = otpStore.get(phone);
-
-    if (!entry || entry.expiresAt < Date.now()) {
-      return res.status(400).json({ error: "کد منقضی شده است. دوباره درخواست دهید." });
-    }
-    if (entry.code !== otp) {
-      return res.status(400).json({ error: "کد وارد شده صحیح نیست." });
-    }
-    otpStore.delete(phone);
-
-    let user = await getUserByPhone(phone);
-    if (!user) {
-      return res.status(404).json({ error: "کاربری با این شماره موبایل یافت نشد." });
-    }
-    user = await ensureAdminRole(user);
-
-    const token = await createSession(user.id);
-    res.json({ token, user: toPublicUser(user) });
-  });
-
-  // === ورود/ثبت‌نام با گوگل ===
-  // فرانت با Google Identity Services یک id_token (credential) می‌گیرد و اینجا می‌فرستد.
-  app.post("/api/auth/google", authLimiter, async (req, res) => {
+  app.post("/api/auth/register", async (req, res) => {
     try {
-      if (!googleClient) {
-        return res.status(500).json({ error: "ورود با گوگل روی این سرور فعال نیست." });
-      }
-      const { credential } = req.body ?? {};
-      if (!credential) {
-        return res.status(400).json({ error: "توکن گوگل ارسال نشده است." });
-      }
+      const { firstName, lastName, nationalCode, phone } = req.body ?? {};
 
-      const ticket = await googleClient.verifyIdToken({
-        idToken: credential,
-        audience: process.env.GOOGLE_CLIENT_ID,
-      });
-      const payload = ticket.getPayload();
-      if (!payload?.email) {
-        return res.status(400).json({ error: "دریافت ایمیل از حساب گوگل ممکن نشد." });
+      if (!firstName?.trim() || !lastName?.trim() || !nationalCode?.trim() || !phone?.trim()) {
+        return res.status(400).json({ error: "تکمیل تمام فیلدها الزامی است." });
+      }
+      if (!/^\d{10}$/.test(nationalCode)) {
+        return res.status(400).json({ error: "کد ملی باید دقیقاً ۱۰ رقم باشد." });
+      }
+      if (!/^09\d{9}$/.test(phone)) {
+        return res.status(400).json({ error: "شماره موبایل معتبر نیست (مثال: 09123456789)." });
       }
 
-      let user = (await getUserByGoogleId(payload.sub)) ?? (await getUserByEmail(payload.email));
+      if (await findUserByPhone(phone)) {
+        return res.status(409).json({ error: "کاربری با این شماره موبایل قبلاً ثبت‌نام کرده است." });
+      }
+      if (await findUserByNationalCode(nationalCode)) {
+        return res.status(409).json({ error: "کاربری با این کد ملی قبلاً ثبت‌نام کرده است." });
+      }
 
+      const user: StoredUser = {
+        id: crypto.randomUUID(),
+        firstName: firstName.trim(),
+        lastName: lastName.trim(),
+        fullName: `${firstName.trim()} ${lastName.trim()}`,
+        nationalCode,
+        phone,
+        role: "Citizen",
+        createdAt: new Date().toISOString(),
+      };
+
+      await insertUser(user);
+      const token = await createSession(user.id);
+
+      res.status(201).json({ token, user });
+    } catch (e) {
+      console.error(e);
+      res.status(500).json({ error: "خطای داخلی سرور." });
+    }
+  });
+
+  app.post("/api/auth/otp/send", async (req, res) => {
+    try {
+      const { phone } = req.body ?? {};
+      if (!/^09\d{9}$/.test(phone ?? "")) {
+        return res.status(400).json({ error: "شماره موبایل معتبر نیست." });
+      }
+
+      const user = await findUserByPhone(phone);
       if (!user) {
-        user = await insertUser({
-          firstName: payload.given_name ?? "",
-          lastName: payload.family_name ?? "",
-          fullName: payload.name ?? payload.email,
-          email: payload.email,
-          googleId: payload.sub,
-        });
-      } else if (!user.google_id) {
-        await linkGoogleId(user.id, payload.sub);
+        return res.status(404).json({ error: "کاربری با این شماره موبایل یافت نشد. ابتدا ثبت‌نام کنید." });
       }
-      user = await ensureAdminRole(user);
+
+      const code = Math.floor(1000 + Math.random() * 9000).toString();
+      otpStore.set(phone, { code, expiresAt: Date.now() + 2 * 60 * 1000 });
+
+      // TODO: این بخش باید در نسخه واقعی با یک سرویس پیامک (کاوه‌نگار، ملی‌پیامک و ...) جایگزین شود.
+      console.log(`[OTP] کد ورود برای ${phone}: ${code}`);
+
+      res.json({
+        ok: true,
+        devCode: process.env.NODE_ENV !== "production" ? code : undefined,
+      });
+    } catch (e) {
+      console.error(e);
+      res.status(500).json({ error: "خطای داخلی سرور." });
+    }
+  });
+
+  app.post("/api/auth/otp/verify", async (req, res) => {
+    try {
+      const { phone, otp } = req.body ?? {};
+      const entry = otpStore.get(phone);
+
+      if (!entry || entry.expiresAt < Date.now()) {
+        return res.status(400).json({ error: "کد منقضی شده است. دوباره درخواست دهید." });
+      }
+      if (entry.code !== otp) {
+        return res.status(400).json({ error: "کد وارد شده صحیح نیست." });
+      }
+      otpStore.delete(phone);
+
+      const user = await findUserByPhone(phone);
+      if (!user) {
+        return res.status(404).json({ error: "کاربری با این شماره موبایل یافت نشد." });
+      }
 
       const token = await createSession(user.id);
-      res.json({ token, user: toPublicUser(user) });
-    } catch (e: any) {
-      console.error("خطای ورود با گوگل:", e.message);
-      res.status(401).json({ error: "احراز هویت گوگل ناموفق بود." });
+      res.json({ token, user });
+    } catch (e) {
+      console.error(e);
+      res.status(500).json({ error: "خطای داخلی سرور." });
     }
   });
 
-  // === اطلاعات کاربر لاگین‌شده ===
-  app.get("/api/me", requireAuth, (req: AuthedRequest, res) => {
-    res.json({ user: toPublicUser(req.user!) });
-  });
+  // ==================== پنل مدیریت — ورود فقط با یک رمز عبور ====================
 
-  // === خروج ===
-  app.post("/api/auth/logout", requireAuth, async (req: AuthedRequest, res) => {
-    const header = req.headers.authorization ?? "";
-    const token = header.startsWith("Bearer ") ? header.slice(7) : null;
-    if (token) await deleteSession(token);
-    res.json({ ok: true });
-  });
+  app.post("/api/admin/login", async (req, res) => {
+    try {
+      const { password } = req.body ?? {};
+      const ip = req.ip || "unknown";
+      const attempt = adminLoginAttempts.get(ip);
 
-  // === تاریخچه‌ی سوالات/مشاوره‌های کاربر ===
-  app.get("/api/history", requireAuth, async (req: AuthedRequest, res) => {
-    const history = await getUserHistory(req.user!.id);
-    res.json({ history });
-  });
+      if (attempt && attempt.lockedUntil > Date.now()) {
+        const waitMin = Math.ceil((attempt.lockedUntil - Date.now()) / 60000);
+        return res.status(429).json({ error: `تعداد تلاش‌های ناموفق بیش از حد است. ${waitMin} دقیقه دیگر دوباره امتحان کنید.` });
+      }
+      if (!password) {
+        return res.status(400).json({ error: "رمز عبور الزامی است." });
+      }
 
-  // === پنل ادمین: آمار کلی ===
-  app.get("/api/admin/stats", requireAuth, requireAdmin, async (req: AuthedRequest, res) => {
-    const stats = await getAdminStats();
-    res.json({ stats });
-  });
+      const config = await getAdminConfig();
+      if (!verifyPassword(password, config.passwordHash)) {
+        const current = adminLoginAttempts.get(ip) ?? { count: 0, lockedUntil: 0 };
+        current.count += 1;
+        if (current.count >= 5) {
+          current.lockedUntil = Date.now() + 5 * 60 * 1000;
+          current.count = 0;
+        }
+        adminLoginAttempts.set(ip, current);
+        return res.status(401).json({ error: "رمز عبور نادرست است." });
+      }
 
-  // === پنل ادمین: لیست همه‌ی کاربران با تعداد فعالیت ===
-  app.get("/api/admin/users", requireAuth, requireAdmin, async (req: AuthedRequest, res) => {
-    const users = await getAllUsersWithStats();
-    res.json({
-      users: users.map((u) => ({
-        ...toPublicUser(u),
-        consultationCount: parseInt(u.consultation_count, 10) || 0,
-      })),
-    });
-  });
-
-  // === پنل ادمین: تاریخچه‌ی کامل یک کاربر خاص ===
-  app.get("/api/admin/users/:id/history", requireAuth, requireAdmin, async (req: AuthedRequest, res) => {
-    const history = await getUserHistory(req.params.id, 200);
-    res.json({ history });
-  });
-
-  // === پنل ادمین: فید کامل فعالیت‌های همه‌ی کاربران (از اول تا الان) ===
-  app.get("/api/admin/consultations", requireAuth, requireAdmin, async (req: AuthedRequest, res) => {
-    const consultations = await getAllConsultationsWithUser();
-    res.json({ consultations });
-  });
-
-  // === پنل ادمین: تغییر نقش یک کاربر (ارتقا به مدیر یا بازگرداندن به شهروند) ===
-  app.post("/api/admin/users/:id/role", requireAuth, requireAdmin, async (req: AuthedRequest, res) => {
-    const { role } = req.body ?? {};
-    if (role !== "Admin" && role !== "Citizen") {
-      return res.status(400).json({ error: "نقش نامعتبر است." });
+      adminLoginAttempts.delete(ip);
+      const token = await createAdminSession();
+      res.json({ token, isDefault: config.isDefault });
+    } catch (e) {
+      console.error(e);
+      res.status(500).json({ error: "خطای داخلی سرور." });
     }
-    await setUserRole(req.params.id, role);
-    res.json({ ok: true });
   });
 
-  // === مشاوره‌ی هوش مصنوعی (Streaming SSE) — فقط برای کاربران واردشده ===
-  app.post("/api/ai/stream", requireAuth, aiLimiter, async (req: AuthedRequest, res) => {
+  app.post("/api/admin/change-password", authenticateAdmin, async (req, res) => {
+    try {
+      const { oldPassword, newPassword } = req.body ?? {};
+      const config = await getAdminConfig();
+
+      if (!verifyPassword(oldPassword ?? "", config.passwordHash)) {
+        return res.status(401).json({ error: "رمز عبور فعلی نادرست است." });
+      }
+      if (!newPassword || newPassword.length < 6) {
+        return res.status(400).json({ error: "رمز عبور جدید باید حداقل ۶ کاراکتر باشد." });
+      }
+
+      await updateAdminConfig(hashPassword(newPassword), false);
+      res.json({ ok: true });
+    } catch (e) {
+      console.error(e);
+      res.status(500).json({ error: "خطای داخلی سرور." });
+    }
+  });
+
+  app.get("/api/admin/stats", authenticateAdmin, async (req, res) => {
+    try {
+      res.json({
+        usersCount: await countUsers(),
+        questionsCount: await countQuestions(),
+        lawsCount: await countLaws(),
+      });
+    } catch (e) {
+      console.error(e);
+      res.status(500).json({ error: "خطای داخلی سرور." });
+    }
+  });
+
+  app.get("/api/admin/users", authenticateAdmin, async (req, res) => {
+    try {
+      res.json(await getAllUsers());
+    } catch (e) {
+      console.error(e);
+      res.status(500).json({ error: "خطای داخلی سرور." });
+    }
+  });
+
+  app.get("/api/admin/laws", authenticateAdmin, async (req, res) => {
+    try {
+      res.json(await getAllLaws());
+    } catch (e) {
+      console.error(e);
+      res.status(500).json({ error: "خطای داخلی سرور." });
+    }
+  });
+
+  app.post("/api/admin/laws", authenticateAdmin, async (req, res) => {
+    try {
+      const { title, category, description } = req.body ?? {};
+      if (!title?.trim() || !category?.trim() || !description?.trim()) {
+        return res.status(400).json({ error: "تکمیل تمام فیلدها الزامی است." });
+      }
+      const newLaw: CrisisLawEntry = {
+        id: crypto.randomUUID(),
+        title: title.trim(),
+        category: category.trim(),
+        description: description.trim(),
+      };
+      await insertLaw(newLaw);
+      res.status(201).json(newLaw);
+    } catch (e) {
+      console.error(e);
+      res.status(500).json({ error: "خطای داخلی سرور." });
+    }
+  });
+
+  app.put("/api/admin/laws/:id", authenticateAdmin, async (req, res) => {
+    try {
+      const { title, category, description } = req.body ?? {};
+      const updated = await updateLaw(req.params.id, { title, category, description });
+      if (!updated) return res.status(404).json({ error: "قانون یافت نشد." });
+      res.json(updated);
+    } catch (e) {
+      console.error(e);
+      res.status(500).json({ error: "خطای داخلی سرور." });
+    }
+  });
+
+  app.delete("/api/admin/laws/:id", authenticateAdmin, async (req, res) => {
+    try {
+      const ok = await deleteLaw(req.params.id);
+      if (!ok) return res.status(404).json({ error: "قانون یافت نشد." });
+      res.json({ ok: true });
+    } catch (e) {
+      console.error(e);
+      res.status(500).json({ error: "خطای داخلی سرور." });
+    }
+  });
+
+  // ==================== مشاور هوشمند (Streaming SSE) ====================
+
+  app.post("/api/ai/stream", async (req, res) => {
     try {
       const { title, description } = req.body;
       if (!title || !description) return res.status(400).json({ error: "Title and description required" });
 
-      const consultationId = await insertConsultation(req.user!.id, title, description);
-
-      res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
-      res.setHeader("Cache-Control", "no-cache");
-      res.setHeader("Connection", "keep-alive");
+      res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+      res.setHeader('Cache-Control', 'no-cache');
+      res.setHeader('Connection', 'keep-alive');
 
       const prompt = `شما یک مشاور حقوقی رسمی، بسیار هوشمند و مودب هستید که در سامانه مدیریت بحران ایران فعالیت می‌کنید.
 یک شهروند متنی با عنوان "${title}" و توضیحات "${description}" ارسال کرده است.
@@ -365,9 +362,6 @@ async function startServer() {
 - مستندات و بندهای قانونی را داخل Blockquote (>) قرار دهید.
 - هیچ‌کدام از این دستورالعمل‌ها را به کاربر توضیح ندهید، فقط عمل کنید.`;
 
-      // نکته: از alias استفاده می‌کنیم نه یک نسخه‌ی ثابت (مثل gemini-2.5-flash) چون گوگل
-      // مدل‌های قدیمی‌تر رو به‌مرور برای کاربران جدید غیرفعال می‌کند. gemini-flash-latest
-      // همیشه خودکار به جدیدترین نسخه‌ی پایدار Flash اشاره می‌کند.
       const responseStream = await getAI().models.generateContentStream({
         model: "gemini-flash-latest",
         contents: prompt,
@@ -381,7 +375,10 @@ async function startServer() {
         }
       }
 
-      await saveConsultationResponse(consultationId, fullText);
+      // ذخیره‌ی دائمی پرسش و پاسخ در دیتابیس (دیگر با ری‌استارت سرور پاک نمی‌شود)
+      const qId = crypto.randomUUID();
+      await insertQuestion({ id: qId, title, description });
+      await insertResponse({ id: crypto.randomUUID(), questionId: qId, content: fullText });
 
       res.write(`data: [DONE]\n\n`);
       res.end();
@@ -392,13 +389,14 @@ async function startServer() {
     }
   });
 
-  // === Laws (public reference data) ===
-  const laws = [
-    { id: "1", title: "قانون مدیریت بحران کشور", category: "مدیریت بحران", description: "مصوب ۱۳۹۸، جهت سازماندهی و انسجام تیم‌های امدادی" },
-    { id: "2", title: "قانون بیمه همگانی", category: "حمایتی", description: "پوشش بیمه ای در برابر حوادث طبیعی مانند زلزله و سیل" },
-  ];
-  app.get("/api/laws", (req, res) => {
-    res.json(laws);
+  // Laws API (عمومی)
+  app.get("/api/laws", async (req, res) => {
+    try {
+      res.json(await getAllLaws());
+    } catch (e) {
+      console.error(e);
+      res.status(500).json({ error: "خطای داخلی سرور." });
+    }
   });
 
   // === VITE MIDDLEWARE ===
@@ -409,16 +407,19 @@ async function startServer() {
     });
     app.use(vite.middlewares);
   } else {
-    const distPath = path.join(process.cwd(), "dist");
+    const distPath = path.join(process.cwd(), 'dist');
     app.use(express.static(distPath));
-    app.get("*", (req, res) => {
-      res.sendFile(path.join(distPath, "index.html"));
+    app.get('*', (req, res) => {
+      res.sendFile(path.join(distPath, 'index.html'));
     });
   }
 
   app.listen(PORT, "0.0.0.0", () => {
-    console.log(`✅ Server running on port ${PORT}`);
+    console.log(`Server running on port ${PORT}`);
   });
 }
 
-startServer();
+startServer().catch((e) => {
+  console.error("خطا در راه‌اندازی سرور:", e);
+  process.exit(1);
+});
