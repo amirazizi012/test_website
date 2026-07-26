@@ -1,5 +1,5 @@
 import { Link } from "react-router-dom";
-import { Shield } from "lucide-react";
+import { Shield, ShieldAlert } from "lucide-react";
 import { cn } from "../../lib/utils";
 
 export default function Navbar() {
@@ -30,6 +30,14 @@ export default function Navbar() {
             <Link to="/auth/register" className="h-12 px-6 rounded-[16px] bg-[#0F172A] hover:bg-[#1e293b] text-white font-bold flex items-center justify-center transition-all shadow-sm">
               ثبت نام جدید
             </Link>
+            <Link
+              to="/admin/login"
+              className={cn(
+                "flex items-center gap-2 text-[#64748B] hover:text-[#0F172A] transition-colors font-medium")}
+                >
+                <ShieldAlert className="w-4 h-4" />
+                               پنل مدیریت
+              </Link>
           </div>
         </div>
       </div>
