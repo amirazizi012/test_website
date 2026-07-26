@@ -87,6 +87,7 @@ async function startServer() {
   await initDb();
 
   const app = express();
+  app.set("trust proxy", 1); // لازم برای اینکه express-rate-limit پشت پراکسی Render درست کار کند
   app.use(express.json());
 
   // === CORS ===
@@ -364,8 +365,11 @@ async function startServer() {
 - مستندات و بندهای قانونی را داخل Blockquote (>) قرار دهید.
 - هیچ‌کدام از این دستورالعمل‌ها را به کاربر توضیح ندهید، فقط عمل کنید.`;
 
+      // نکته: از alias استفاده می‌کنیم نه یک نسخه‌ی ثابت (مثل gemini-2.5-flash) چون گوگل
+      // مدل‌های قدیمی‌تر رو به‌مرور برای کاربران جدید غیرفعال می‌کند. gemini-flash-latest
+      // همیشه خودکار به جدیدترین نسخه‌ی پایدار Flash اشاره می‌کند.
       const responseStream = await getAI().models.generateContentStream({
-        model: "gemini-2.5-flash",
+        model: "gemini-flash-latest",
         contents: prompt,
       });
 
