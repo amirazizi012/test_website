@@ -127,7 +127,7 @@ export default function CitizenDashboard() {
                   const lastIndex = newHistory.length - 1;
                   newHistory[lastIndex] = {
                     ...newHistory[lastIndex],
-                    content: newHistory[lastIndex].content + "\n[خطا: " + data.error + "]"
+                    content: newHistory[lastIndex].content + "\n[خطا: " + data.error + (data.details ? " — " + data.details : "") + "]"
                   };
                   return newHistory;
                 });
