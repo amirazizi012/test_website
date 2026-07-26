@@ -1,99 +1,88 @@
-import React, { useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { useState } from "react";
+import { Link, useNavigate } from "react-router-dom";
+import { motion } from "motion/react";
+import { ShieldAlert, ArrowRight, Loader2 } from "lucide-react";
+import { Input } from "../components/ui/Input";
+import { Button } from "../components/ui/Button";
+import { saveAdminSession } from "../lib/adminAuth";
 
 export default function AdminLogin() {
-  const [password, setPassword] = useState("");
-  const [error, setError] = useState("");
-  const [loading, setLoading] = useState(false);
   const navigate = useNavigate();
+  const [password, setPassword] = useState("");
+  const [isLoading, setIsLoading] = useState(false);
+  const [error, setError] = useState("");
 
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!password) {
-      setError("لطفاً رمز عبور را وارد کنید.");
-      return;
-    }
-
     setError("");
-    setLoading(true);
-
+    setIsLoading(true);
     try {
-      // ارسال درخواست به روت جدیدی که در سرور ساختیم
-      const response = await fetch("/api/admin/login", {
+      const res = await fetch("/api/admin/login", {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ password }),
       });
-
-      const data = await response.json();
-
-      if (!response.ok) {
-        setError(data.error || "رمز عبور اشتباه است یا مشکلی پیش آمده.");
-        setLoading(false);
+      const data = await res.json();
+      if (!res.ok) {
+        setError(data.error || "ورود ناموفق بود.");
         return;
       }
-
-      // ۱. ذخیره توکن ادمین در مرورگر
-      localStorage.setItem("token", data.token);
-
-      // ۲. ساخت یک کاربر مجازی در فرانت‌اند تا بقیه کامپوننت‌ها بفهمند ادمین لاگین کرده
-      const adminUser = {
-        id: "fixed-admin",
-        role: "Admin",
-        fullName: "مدیر سامانه",
-      };
-      localStorage.setItem("user", JSON.stringify(adminUser));
-
-      // ۳. انتقال مستقیم به داشبورد مدیریت
-      // نکته: اگر مسیر داشبورد شما چیز دیگری است (مثلا /admin/dashboard) آن را اینجا تغییر دهید
-      navigate("/admin"); 
-      
-      // اگر فرانت‌اند شما از Context خاصی برای لاگین استفاده می‌کند، 
-      // رفرش کردن صفحه باعث می‌شود Context اطلاعات جدید را از LocalStorage بخواند
-      window.location.reload(); 
-
-    } catch (err) {
-      setError("خطا در ارتباط با سرور. لطفاً اتصال اینترنت را بررسی کنید.");
-      setLoading(false);
+      // فقط همینجا نشست ادمین ذخیره می‌شود؛ صفحه‌ی دیگری در میانه وجود ندارد.
+      saveAdminSession(data.token, data.isDefault);
+      navigate("/admin/dashboard", { replace: true });
+    } catch {
+      setError("ارتباط با سرور برقرار نشد.");
+    } finally {
+      setIsLoading(false);
     }
   };
 
   return (
-    <div style={{ maxWidth: "400px", margin: "100px auto", textAlign: "center", fontFamily: "Tahoma, sans-serif" }}>
-      <h2>ورود به پنل مدیریت</h2>
-      
-      {error && (
-        <div style={{ backgroundColor: "#ffcccc", color: "#cc0000", padding: "10px", borderRadius: "5px", marginBottom: "15px" }}>
-          {error}
-        </div>
-      )}
+    <div className="min-h-screen bg-gradient-to-br from-[#fdfdfd] to-[#f0f4f2] flex flex-col items-center justify-center relative px-4 text-[#1A2E35] font-sans">
+      <Link to="/" className="absolute top-8 right-8 text-[#64748B] hover:text-[#0F172A] flex items-center gap-2 transition-colors font-medium">
+        <ArrowRight className="w-5 h-5" />
+        بازگشت به سایت
+      </Link>
 
-      <form onSubmit={handleLogin} style={{ display: "flex", flexDirection: "column", gap: "15px" }}>
-        <input
-          type="password"
-          placeholder="رمز عبور مدیر را وارد کنید..."
-          value={password}
-          onChange={(e) => setPassword(e.target.value)}
-          style={{ padding: "10px", fontSize: "16px", borderRadius: "5px", border: "1px solid #ccc", textAlign: "center" }}
-        />
-        <button 
-          type="submit" 
-          disabled={loading}
-          style={{ 
-            padding: "10px", 
-            fontSize: "16px", 
-            backgroundColor: "#007bff", 
-            color: "white", 
-            border: "none", 
-            borderRadius: "5px", 
-            cursor: loading ? "not-allowed" : "pointer" 
-          }}
-        >
-          {loading ? "در حال بررسی..." : "ورود"}
-        </button>
-      </form>
+      <motion.div
+        initial={{ opacity: 0, y: 20 }}
+        animate={{ opacity: 1, y: 0 }}
+        className="w-full max-w-md bg-white border border-black/5 rounded-[32px] p-10 shadow-[0_30px_60px_rgba(0,0,0,0.05)] relative z-10"
+      >
+        <div className="flex flex-col items-center mb-8 text-center">
+          <div className="w-16 h-16 bg-[#0F172A] rounded-2xl flex items-center justify-center text-white font-bold text-3xl mb-4 shadow-lg">
+            <ShieldAlert className="w-8 h-8" />
+          </div>
+          <h1 className="text-[28px] font-extrabold text-[#0F172A] tracking-tight mb-2">ورود به پنل مدیریت</h1>
+          <p className="text-[16px] text-[#64748B]">این بخش فقط برای مدیران سامانه است.</p>
+        </div>
+
+        {error && (
+          <div className="bg-[#FEF2F2] border border-[#FECACA] text-[#B91C1C] text-[14px] font-medium rounded-xl px-4 py-3 text-center mb-6">
+            {error}
+          </div>
+        )}
+
+        <form onSubmit={handleLogin} className="space-y-6">
+          <div className="space-y-2">
+            <label className="text-[15px] font-semibold text-[#0F172A] pr-1">رمز عبور مدیر</label>
+            <Input
+              type="password"
+              required
+              placeholder="رمز عبور را وارد کنید"
+              dir="ltr"
+              className="text-center"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              autoFocus
+            />
+          </div>
+
+          <Button type="submit" size="lg" className="w-full mt-4" disabled={isLoading || !password}>
+            {isLoading ? <Loader2 className="w-6 h-6 animate-spin" /> : "ورود"}
+          </Button>
+        </form>
+      </motion.div>
     </div>
   );
 }
