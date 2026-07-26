@@ -1,4 +1,4 @@
-import { createBrowserRouter, RouterProvider } from "react-router-dom";
+import { createBrowserRouter, RouterProvider, Navigate } from "react-router-dom";
 import Home from "./pages/Home";
 import Login from "./pages/Login";
 import Register from "./pages/Register";
@@ -42,6 +42,11 @@ const router = createBrowserRouter([
   {
     path: "/dashboard/reports",
     element: <CrisisReports />,
+  },
+  {
+    // مسیر کوتاه /admin برای راحتی، مستقیم به صفحه‌ی ورود ادمین می‌رود
+    path: "/admin",
+    element: <Navigate to="/admin/login" replace />,
   },
   {
     path: "/admin/login",
