@@ -24,20 +24,17 @@ export default function Navbar() {
           </div>
 
           <div className="flex items-center gap-4">
-            <Link to="/auth/login" className="text-[17px] font-bold text-[#0F172A] hover:text-[#0D9488] transition-colors px-4 py-2">
-              تایید شماره موبایل
+            <Link to="/auth/login" className="text-[#64748B] hover:text-[#0F172A] font-medium">
+                    ورود کاربران
             </Link>
             <Link to="/auth/register" className="h-12 px-6 rounded-[16px] bg-[#0F172A] hover:bg-[#1e293b] text-white font-bold flex items-center justify-center transition-all shadow-sm">
               ثبت نام جدید
             </Link>
-            <Link
-              to="/admin/login"
-              className={cn(
-                "flex items-center gap-2 text-[#64748B] hover:text-[#0F172A] transition-colors font-medium")}
-                >
-                <ShieldAlert className="w-4 h-4" />
-                               پنل مدیریت
+            <Link to="/admin/login" className="flex items-center gap-2 text-[#64748B] hover:text-[#0F172A] font-medium">
+              <ShieldAlert className="w-4 h-4" />
+                  ورود ادمین 
               </Link>
+                
           </div>
         </div>
       </div>
