@@ -1,332 +1,349 @@
-import { useState, useEffect } from "react";
-import { useNavigate } from "react-router-dom";
-import { ShieldAlert, LogOut, Users, Scale, KeyRound, LayoutDashboard, Plus, Trash2, AlertTriangle, Loader2, Check } from "lucide-react";
-import { Button } from "../components/ui/Button";
-import { Input } from "../components/ui/Input";
-import { getAdminToken, isAdminDefaultPassword, setAdminDefaultPassword, isAdminLoggedIn, adminLogout } from "../lib/adminAuth";
+import { useEffect, useState } from "react";
+import { Link, useNavigate } from "react-router-dom";
+import { Users, LogOut, ArrowRight, Loader2, X, MessageSquare, ShieldCheck, ShieldOff, Activity } from "lucide-react";
+import { getCurrentUser, logout, apiFetch } from "../lib/auth";
 
 interface AdminUser {
   id: string;
   firstName: string;
   lastName: string;
   fullName: string;
-  nationalCode: string;
-  phone: string;
+  nationalCode: string | null;
+  phone: string | null;
+  email: string | null;
   role: string;
   createdAt: string;
+  consultationCount: number;
 }
 
-interface AdminLaw {
+interface HistoryItem {
   id: string;
   title: string;
-  category: string;
   description: string;
+  response: string | null;
+  created_at: string;
 }
 
-type Tab = "overview" | "laws" | "users" | "password";
-type AuthedFetch = (url: string, options?: RequestInit) => Promise<Response>;
+interface FeedItem {
+  id: string;
+  full_name: string;
+  phone: string | null;
+  national_code: string | null;
+  title: string;
+  description: string;
+  response: string | null;
+  created_at: string;
+}
+
+interface Stats {
+  totalUsers: string;
+  totalConsultations: string;
+  usersLast7Days: string;
+  consultationsLast7Days: string;
+}
+
+type Tab = "users" | "feed";
 
 export default function AdminDashboard() {
   const navigate = useNavigate();
-  const [tab, setTab] = useState<Tab>(isAdminDefaultPassword() ? "password" : "overview");
-  const [stats, setStats] = useState<{ usersCount: number; questionsCount: number; lawsCount: number } | null>(null);
+  const user = getCurrentUser();
+
+  const [tab, setTab] = useState<Tab>("users");
+  const [stats, setStats] = useState<Stats | null>(null);
   const [users, setUsers] = useState<AdminUser[]>([]);
-  const [laws, setLaws] = useState<AdminLaw[]>([]);
-  const [showDefaultWarning, setShowDefaultWarning] = useState(isAdminDefaultPassword());
+  const [feed, setFeed] = useState<FeedItem[]>([]);
+  const [isLoading, setIsLoading] = useState(true);
+  const [error, setError] = useState("");
+
+  const [selectedUser, setSelectedUser] = useState<AdminUser | null>(null);
+  const [history, setHistory] = useState<HistoryItem[]>([]);
+  const [isHistoryLoading, setIsHistoryLoading] = useState(false);
 
   useEffect(() => {
-    if (!isAdminLoggedIn()) navigate("/admin/login");
-  }, [navigate]);
-
-  const authedFetch: AuthedFetch = async (url, options = {}) => {
-    const res = await fetch(url, {
-      ...options,
-      headers: {
-        ...(options.headers || {}),
-        Authorization: `Bearer ${getAdminToken()}`,
-      },
-    });
-    if (res.status === 401) {
-      adminLogout();
-      navigate("/admin/login");
-      throw new Error("جلسه منقضی شده است.");
+    if (!user) {
+      navigate("/auth/login");
+      return;
     }
-    return res;
-  };
+    if (user.role !== "Admin") {
+      navigate("/dashboard/citizen");
+      return;
+    }
+    loadAll();
+  }, [user, navigate]);
 
-  useEffect(() => {
-    authedFetch("/api/admin/stats").then((r) => r.json()).then(setStats).catch(() => {});
-    authedFetch("/api/admin/laws").then((r) => r.json()).then(setLaws).catch(() => {});
-    authedFetch("/api/admin/users").then((r) => r.json()).then(setUsers).catch(() => {});
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  async function loadAll() {
+    setIsLoading(true);
+    setError("");
+    try {
+      const [statsRes, usersRes, feedRes] = await Promise.all([
+        apiFetch("/api/admin/stats"),
+        apiFetch("/api/admin/users"),
+        apiFetch("/api/admin/consultations"),
+      ]);
+      const statsData = await statsRes.json();
+      const usersData = await usersRes.json();
+      const feedData = await feedRes.json();
+
+      if (!statsRes.ok || !usersRes.ok || !feedRes.ok) {
+        setError(statsData.error || usersData.error || feedData.error || "خطا در دریافت اطلاعات.");
+        return;
+      }
+
+      setStats(statsData.stats);
+      setUsers(usersData.users);
+      setFeed(feedData.consultations);
+    } catch {
+      setError("ارتباط با سرور برقرار نشد.");
+    } finally {
+      setIsLoading(false);
+    }
+  }
+
+  async function openUserHistory(u: AdminUser) {
+    setSelectedUser(u);
+    setIsHistoryLoading(true);
+    try {
+      const res = await apiFetch(`/api/admin/users/${u.id}/history`);
+      const data = await res.json();
+      setHistory(res.ok ? data.history : []);
+    } catch {
+      setHistory([]);
+    } finally {
+      setIsHistoryLoading(false);
+    }
+  }
+
+  async function toggleRole(u: AdminUser) {
+    const newRole = u.role === "Admin" ? "Citizen" : "Admin";
+    if (!confirm(`آیا مطمئنید می‌خواهید نقش «${u.fullName}» را به «${newRole === "Admin" ? "مدیر" : "شهروند"}» تغییر دهید؟`)) return;
+
+    const res = await apiFetch(`/api/admin/users/${u.id}/role`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ role: newRole }),
+    });
+    if (res.ok) {
+      setUsers((prev) => prev.map((x) => (x.id === u.id ? { ...x, role: newRole } : x)));
+    }
+  }
+
+  function formatDate(d: string | null) {
+    if (!d) return "—";
+    return new Date(d).toLocaleString("fa-IR", { dateStyle: "medium", timeStyle: "short" });
+  }
 
   return (
-    <div className="min-h-screen bg-gradient-to-br from-[#fdfdfd] to-[#f0f4f2] flex text-[#1A2E35] font-sans">
-      <aside className="w-72 bg-white border-l border-black/5 p-6 flex flex-col shrink-0">
-        <div className="flex items-center gap-3 mb-10 px-2">
-          <div className="w-10 h-10 bg-[#0F172A] rounded-xl flex items-center justify-center text-white">
-            <ShieldAlert className="w-5 h-5" />
-          </div>
-          <span className="font-extrabold text-[#0F172A] text-lg">پنل مدیریت</span>
+    <div className="min-h-screen bg-[#F4F7F5] text-[#1A2E35] font-sans">
+      <header className="h-[100px] flex items-center justify-between px-6 sm:px-10 bg-white border-b border-black/5 sticky top-0 z-10">
+        <div className="flex items-center gap-3">
+          <Link to="/" className="flex items-center gap-3">
+            <div className="w-10 h-10 rounded-xl bg-[#0D9488] flex items-center justify-center text-white font-bold">C</div>
+            <span className="text-[22px] font-extrabold text-[#0F172A] tracking-tight hidden sm:inline">CrisisLaw</span>
+          </Link>
+          <span className="text-[15px] text-[#64748B] border-r border-black/10 pr-3 mr-1">پنل مدیریت</span>
         </div>
 
-        <nav className="flex-1 space-y-2">
-          <SidebarButton icon={LayoutDashboard} label="نمای کلی" active={tab === "overview"} onClick={() => setTab("overview")} />
-          <SidebarButton icon={Scale} label="مدیریت قوانین" active={tab === "laws"} onClick={() => setTab("laws")} />
-          <SidebarButton icon={Users} label="کاربران" active={tab === "users"} onClick={() => setTab("users")} />
-          <SidebarButton icon={KeyRound} label="تغییر رمز عبور" active={tab === "password"} onClick={() => setTab("password")} />
-        </nav>
+        <div className="flex items-center gap-4">
+          <Link to="/dashboard/citizen" className="text-[14px] font-medium text-[#64748B] hover:text-[#0F172A] flex items-center gap-1">
+            <ArrowRight className="w-4 h-4" />
+            بازگشت به داشبورد
+          </Link>
+          <button
+            onClick={() => { logout(); navigate("/"); }}
+            className="flex items-center gap-2 px-4 py-2 rounded-xl text-[#64748B] hover:text-[#EF4444] hover:bg-[#FEF2F2] transition-all text-[14px] font-semibold"
+          >
+            <LogOut className="w-[18px] h-[18px]" />
+            خروج
+          </button>
+        </div>
+      </header>
 
-        <button
-          onClick={() => { adminLogout(); navigate("/"); }}
-          className="w-full flex items-center gap-3 px-4 py-3 rounded-[14px] text-[#64748B] hover:text-[#EF4444] hover:bg-[#FEF2F2] transition-all text-[15px] font-semibold"
-        >
-          <LogOut className="w-5 h-5" />
-          خروج
-        </button>
-      </aside>
-
-      <main className="flex-1 p-10 overflow-y-auto">
-        {showDefaultWarning && (
-          <div className="bg-[#FFFBEB] border border-[#FDE68A] text-[#92400E] rounded-2xl px-6 py-4 mb-8 flex items-center gap-3">
-            <AlertTriangle className="w-6 h-6 shrink-0" />
-            <p className="text-[15px] font-medium">
-              شما هنوز از رمز عبور پیش‌فرض («admin») استفاده می‌کنید. لطفاً همین حالا از تب «تغییر رمز عبور» آن را عوض کنید.
-            </p>
+      <main className="max-w-6xl mx-auto px-6 sm:px-10 py-10">
+        {error && (
+          <div className="bg-[#FEF2F2] border border-[#FECACA] text-[#B91C1C] text-[14px] font-medium rounded-xl px-4 py-3 mb-6">
+            {error}
           </div>
         )}
 
-        {tab === "overview" && (
-          <div>
-            <h1 className="text-[28px] font-extrabold text-[#0F172A] mb-8">نمای کلی سامانه</h1>
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-6">
-              <StatCard label="کاربران ثبت‌نام‌شده" value={stats?.usersCount ?? "—"} />
-              <StatCard label="پرسش‌های ثبت‌شده" value={stats?.questionsCount ?? "—"} />
-              <StatCard label="قوانین ثبت‌شده" value={stats?.lawsCount ?? "—"} />
+        {isLoading ? (
+          <div className="flex items-center justify-center py-24">
+            <Loader2 className="w-8 h-8 animate-spin text-[#0D9488]" />
+          </div>
+        ) : (
+          <>
+            {/* آمار کلی */}
+            {stats && (
+              <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
+                <StatCard label="کل کاربران" value={stats.totalUsers} />
+                <StatCard label="کل فعالیت‌ها" value={stats.totalConsultations} />
+                <StatCard label="کاربران جدید (۷ روز)" value={stats.usersLast7Days} />
+                <StatCard label="فعالیت‌های اخیر (۷ روز)" value={stats.consultationsLast7Days} />
+              </div>
+            )}
+
+            {/* تب‌ها */}
+            <div className="flex items-center gap-2 mb-6 bg-white border border-black/5 rounded-2xl p-1.5 w-fit">
+              <button
+                onClick={() => setTab("users")}
+                className={`flex items-center gap-2 px-5 py-2.5 rounded-xl text-[14px] font-semibold transition-all ${tab === "users" ? "bg-[#0D9488] text-white" : "text-[#64748B] hover:bg-[#F8FAFC]"}`}
+              >
+                <Users className="w-4 h-4" />
+                کاربران
+              </button>
+              <button
+                onClick={() => setTab("feed")}
+                className={`flex items-center gap-2 px-5 py-2.5 rounded-xl text-[14px] font-semibold transition-all ${tab === "feed" ? "bg-[#0D9488] text-white" : "text-[#64748B] hover:bg-[#F8FAFC]"}`}
+              >
+                <Activity className="w-4 h-4" />
+                فعالیت‌های کامل (همه)
+              </button>
             </div>
-          </div>
-        )}
 
-        {tab === "laws" && <LawsPanel laws={laws} setLaws={setLaws} authedFetch={authedFetch} />}
-        {tab === "users" && <UsersPanel users={users} />}
-        {tab === "password" && (
-          <PasswordPanel
-            authedFetch={authedFetch}
-            onChanged={() => { setAdminDefaultPassword(false); setShowDefaultWarning(false); }}
-          />
+            {tab === "users" ? (
+              <div className="bg-white border border-black/5 rounded-[24px] overflow-hidden shadow-sm">
+                <div className="overflow-x-auto">
+                  <table className="w-full text-[14px]">
+                    <thead>
+                      <tr className="bg-[#F8FAFC] border-b border-black/5 text-[#64748B] text-[13px]">
+                        <th className="px-5 py-4 text-right font-semibold">نام</th>
+                        <th className="px-5 py-4 text-right font-semibold">موبایل</th>
+                        <th className="px-5 py-4 text-right font-semibold">ایمیل</th>
+                        <th className="px-5 py-4 text-right font-semibold">کد ملی</th>
+                        <th className="px-5 py-4 text-right font-semibold">نقش</th>
+                        <th className="px-5 py-4 text-right font-semibold">تاریخ ثبت‌نام</th>
+                        <th className="px-5 py-4 text-right font-semibold">تعداد فعالیت</th>
+                        <th className="px-5 py-4"></th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {users.map((u) => (
+                        <tr key={u.id} className="border-b border-black/5 last:border-0 hover:bg-[#F8FAFC] transition-colors">
+                          <td className="px-5 py-4 font-semibold text-[#0F172A]">{u.fullName}</td>
+                          <td className="px-5 py-4 text-left" dir="ltr">{u.phone || "—"}</td>
+                          <td className="px-5 py-4 text-left" dir="ltr">{u.email || "—"}</td>
+                          <td className="px-5 py-4 text-left" dir="ltr">{u.nationalCode || "—"}</td>
+                          <td className="px-5 py-4">
+                            <span className={`px-3 py-1 rounded-full text-[12px] font-bold ${u.role === "Admin" ? "bg-[#0D9488]/10 text-[#0D9488]" : "bg-[#F1F5F9] text-[#64748B]"}`}>
+                              {u.role === "Admin" ? "مدیر" : "شهروند"}
+                            </span>
+                          </td>
+                          <td className="px-5 py-4 text-[#64748B]">{formatDate(u.createdAt)}</td>
+                          <td className="px-5 py-4 font-bold text-[#0F172A]">{u.consultationCount}</td>
+                          <td className="px-5 py-4">
+                            <div className="flex items-center gap-1">
+                              <button
+                                onClick={() => openUserHistory(u)}
+                                disabled={u.consultationCount === 0}
+                                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[#0D9488] hover:bg-[#0D9488]/10 transition-colors text-[13px] font-semibold disabled:opacity-30 disabled:cursor-not-allowed"
+                              >
+                                <MessageSquare className="w-4 h-4" />
+                                تاریخچه
+                              </button>
+                              <button
+                                onClick={() => toggleRole(u)}
+                                title={u.role === "Admin" ? "بازگرداندن به شهروند" : "ارتقا به مدیر"}
+                                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[#64748B] hover:bg-[#F1F5F9] transition-colors text-[13px] font-semibold"
+                              >
+                                {u.role === "Admin" ? <ShieldOff className="w-4 h-4" /> : <ShieldCheck className="w-4 h-4" />}
+                              </button>
+                            </div>
+                          </td>
+                        </tr>
+                      ))}
+                      {users.length === 0 && (
+                        <tr>
+                          <td colSpan={8} className="px-5 py-10 text-center text-[#64748B]">
+                            هنوز هیچ کاربری ثبت‌نام نکرده است.
+                          </td>
+                        </tr>
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            ) : (
+              <div className="space-y-5">
+                {feed.length === 0 && (
+                  <p className="text-center text-[#64748B] py-16 bg-white rounded-[24px] border border-black/5">
+                    هنوز هیچ فعالیتی ثبت نشده است.
+                  </p>
+                )}
+                {feed.map((f) => (
+                  <div key={f.id} className="bg-white border border-black/5 rounded-2xl p-6 shadow-sm">
+                    <div className="flex items-center justify-between mb-3">
+                      <div className="flex items-center gap-2">
+                        <span className="font-bold text-[#0F172A] text-[15px]">{f.full_name}</span>
+                        <span className="text-[13px] text-[#94A3B8]" dir="ltr">{f.phone || f.national_code || ""}</span>
+                      </div>
+                      <span className="text-[12px] text-[#94A3B8]">{formatDate(f.created_at)}</span>
+                    </div>
+                    <p className="text-[13px] font-bold text-[#0D9488] mb-1">{f.title}</p>
+                    <p className="text-[14px] text-[#334155] whitespace-pre-wrap mb-3">{f.description}</p>
+                    {f.response && (
+                      <div className="border-t border-black/5 pt-3 mt-3">
+                        <p className="text-[12px] font-bold text-[#64748B] mb-1">پاسخ سامانه:</p>
+                        <p className="text-[14px] text-[#475569] whitespace-pre-wrap">{f.response}</p>
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+          </>
         )}
       </main>
-    </div>
-  );
-}
 
-function SidebarButton({ icon: Icon, label, active, onClick }: { icon: any; label: string; active: boolean; onClick: () => void }) {
-  return (
-    <button
-      onClick={onClick}
-      className={`w-full flex items-center gap-3 px-4 py-3 rounded-[14px] text-[15px] font-semibold transition-all ${
-        active ? "bg-[#0D9488] text-white shadow-md" : "text-[#64748B] hover:bg-[#F1F5F9]"
-      }`}
-    >
-      <Icon className="w-5 h-5" />
-      {label}
-    </button>
-  );
-}
-
-function StatCard({ label, value }: { label: string; value: string | number }) {
-  return (
-    <div className="bg-white border border-black/5 rounded-2xl p-6 shadow-sm">
-      <p className="text-[14px] text-[#64748B] mb-2">{label}</p>
-      <p className="text-[32px] font-extrabold text-[#0F172A]">{value}</p>
-    </div>
-  );
-}
-
-function LawsPanel({ laws, setLaws, authedFetch }: { laws: AdminLaw[]; setLaws: (l: AdminLaw[]) => void; authedFetch: AuthedFetch }) {
-  const [title, setTitle] = useState("");
-  const [category, setCategory] = useState("");
-  const [description, setDescription] = useState("");
-  const [isSaving, setIsSaving] = useState(false);
-  const [error, setError] = useState("");
-
-  const handleAdd = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setError("");
-    setIsSaving(true);
-    try {
-      const res = await authedFetch("/api/admin/laws", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ title, category, description }),
-      });
-      const data = await res.json();
-      if (!res.ok) {
-        setError(data.error || "خطا در افزودن قانون.");
-        return;
-      }
-      setLaws([...laws, data]);
-      setTitle(""); setCategory(""); setDescription("");
-    } catch {
-      setError("ارتباط با سرور برقرار نشد.");
-    } finally {
-      setIsSaving(false);
-    }
-  };
-
-  const handleDelete = async (id: string) => {
-    if (!confirm("از حذف این قانون مطمئن هستید؟")) return;
-    try {
-      await authedFetch(`/api/admin/laws/${id}`, { method: "DELETE" });
-      setLaws(laws.filter((l) => l.id !== id));
-    } catch {
-      setError("خطا در حذف قانون.");
-    }
-  };
-
-  return (
-    <div>
-      <h1 className="text-[28px] font-extrabold text-[#0F172A] mb-8">مدیریت قوانین</h1>
-
-      <form onSubmit={handleAdd} className="bg-white border border-black/5 rounded-2xl p-6 mb-8 space-y-4">
-        <h2 className="font-bold text-[#0F172A]">افزودن قانون جدید</h2>
-        {error && <div className="bg-[#FEF2F2] border border-[#FECACA] text-[#B91C1C] text-[14px] rounded-xl px-4 py-3">{error}</div>}
-        <Input placeholder="عنوان قانون" value={title} onChange={(e) => setTitle(e.target.value)} required />
-        <Input placeholder="دسته‌بندی" value={category} onChange={(e) => setCategory(e.target.value)} required />
-        <textarea
-          placeholder="شرح قانون"
-          value={description}
-          onChange={(e) => setDescription(e.target.value)}
-          required
-          rows={3}
-          className="w-full rounded-xl border border-black/10 p-4 text-[15px] focus:outline-none focus:ring-2 focus:ring-[#0D9488]"
-        />
-        <Button type="submit" disabled={isSaving}>
-          {isSaving ? <Loader2 className="w-5 h-5 animate-spin" /> : (<><Plus className="w-4 h-4 inline ml-1" /> افزودن</>)}
-        </Button>
-      </form>
-
-      <div className="space-y-4">
-        {laws.map((law) => (
-          <div key={law.id} className="bg-white border border-black/5 rounded-2xl p-6 flex items-start justify-between gap-4">
-            <div>
-              <span className="text-[12px] font-bold text-[#0D9488] bg-[#0D9488]/10 px-2 py-1 rounded-md">{law.category}</span>
-              <h3 className="font-bold text-[#0F172A] mt-2">{law.title}</h3>
-              <p className="text-[14px] text-[#64748B] mt-1">{law.description}</p>
+      {/* پنل تاریخچه‌ی یک کاربر خاص */}
+      {selectedUser && (
+        <div className="fixed inset-0 bg-black/30 z-30 flex justify-end" onClick={() => setSelectedUser(null)}>
+          <div className="w-full max-w-xl h-full bg-white overflow-y-auto p-8" onClick={(e) => e.stopPropagation()}>
+            <div className="flex items-center justify-between mb-6">
+              <div>
+                <h2 className="text-[20px] font-extrabold text-[#0F172A]">{selectedUser.fullName}</h2>
+                <p className="text-[13px] text-[#64748B]" dir="ltr">{selectedUser.phone || selectedUser.email}</p>
+              </div>
+              <button onClick={() => setSelectedUser(null)} className="p-2 rounded-xl hover:bg-[#F1F5F9]">
+                <X className="w-5 h-5" />
+              </button>
             </div>
-            <button onClick={() => handleDelete(law.id)} className="text-[#94A3B8] hover:text-[#EF4444] transition-colors shrink-0">
-              <Trash2 className="w-5 h-5" />
-            </button>
+
+            {isHistoryLoading ? (
+              <div className="flex justify-center py-16">
+                <Loader2 className="w-6 h-6 animate-spin text-[#0D9488]" />
+              </div>
+            ) : history.length === 0 ? (
+              <p className="text-[#64748B] text-center py-16">فعالیتی برای این کاربر ثبت نشده است.</p>
+            ) : (
+              <div className="space-y-5">
+                {history.map((h) => (
+                  <div key={h.id} className="border border-black/5 rounded-2xl p-5 bg-[#F8FAFC]">
+                    <div className="flex items-center justify-between mb-2">
+                      <span className="font-bold text-[#0F172A] text-[15px]">{h.title}</span>
+                      <span className="text-[12px] text-[#94A3B8]">{formatDate(h.created_at)}</span>
+                    </div>
+                    <p className="text-[14px] text-[#334155] whitespace-pre-wrap mb-3">{h.description}</p>
+                    {h.response && (
+                      <div className="border-t border-black/5 pt-3 mt-3">
+                        <p className="text-[12px] font-bold text-[#0D9488] mb-1">پاسخ سامانه:</p>
+                        <p className="text-[14px] text-[#475569] whitespace-pre-wrap">{h.response}</p>
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
-        ))}
-        {laws.length === 0 && <p className="text-[#64748B] text-center py-10">هنوز قانونی ثبت نشده است.</p>}
-      </div>
+        </div>
+      )}
     </div>
   );
 }
 
-function UsersPanel({ users }: { users: AdminUser[] }) {
+function StatCard({ label, value }: { label: string; value: string }) {
   return (
-    <div>
-      <h1 className="text-[28px] font-extrabold text-[#0F172A] mb-8">کاربران ثبت‌نام‌شده</h1>
-      <div className="bg-white border border-black/5 rounded-2xl overflow-hidden overflow-x-auto">
-        <table className="w-full text-right">
-          <thead className="bg-[#F8FAFC]">
-            <tr>
-              <th className="p-4 text-[14px] font-bold text-[#0F172A]">نام</th>
-              <th className="p-4 text-[14px] font-bold text-[#0F172A]">موبایل</th>
-              <th className="p-4 text-[14px] font-bold text-[#0F172A]">کد ملی</th>
-              <th className="p-4 text-[14px] font-bold text-[#0F172A]">تاریخ ثبت‌نام</th>
-            </tr>
-          </thead>
-          <tbody>
-            {users.map((u) => (
-              <tr key={u.id} className="border-t border-black/5">
-                <td className="p-4 text-[14px]">{u.fullName}</td>
-                <td className="p-4 text-[14px]" dir="ltr">{u.phone}</td>
-                <td className="p-4 text-[14px]" dir="ltr">{u.nationalCode}</td>
-                <td className="p-4 text-[14px]">{new Date(u.createdAt).toLocaleDateString("fa-IR")}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-        {users.length === 0 && <p className="text-[#64748B] text-center py-10">هنوز کاربری ثبت‌نام نکرده است.</p>}
-      </div>
-    </div>
-  );
-}
-
-function PasswordPanel({ authedFetch, onChanged }: { authedFetch: AuthedFetch; onChanged: () => void }) {
-  const [oldPassword, setOldPassword] = useState("");
-  const [newPassword, setNewPassword] = useState("");
-  const [confirmPassword, setConfirmPassword] = useState("");
-  const [error, setError] = useState("");
-  const [success, setSuccess] = useState(false);
-  const [isSaving, setIsSaving] = useState(false);
-
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setError("");
-    setSuccess(false);
-
-    if (newPassword.length < 6) {
-      setError("رمز عبور جدید باید حداقل ۶ کاراکتر باشد.");
-      return;
-    }
-    if (newPassword !== confirmPassword) {
-      setError("تکرار رمز عبور با رمز جدید یکسان نیست.");
-      return;
-    }
-
-    setIsSaving(true);
-    try {
-      const res = await authedFetch("/api/admin/change-password", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ oldPassword, newPassword }),
-      });
-      const data = await res.json();
-      if (!res.ok) {
-        setError(data.error || "خطا در تغییر رمز عبور.");
-        return;
-      }
-      setSuccess(true);
-      setOldPassword(""); setNewPassword(""); setConfirmPassword("");
-      onChanged();
-    } catch {
-      setError("ارتباط با سرور برقرار نشد.");
-    } finally {
-      setIsSaving(false);
-    }
-  };
-
-  return (
-    <div className="max-w-md">
-      <h1 className="text-[28px] font-extrabold text-[#0F172A] mb-8">تغییر رمز عبور مدیر</h1>
-      <form onSubmit={handleSubmit} className="bg-white border border-black/5 rounded-2xl p-6 space-y-4">
-        {error && <div className="bg-[#FEF2F2] border border-[#FECACA] text-[#B91C1C] text-[14px] rounded-xl px-4 py-3">{error}</div>}
-        {success && (
-          <div className="bg-[#F0FDF4] border border-[#BBF7D0] text-[#166534] text-[14px] rounded-xl px-4 py-3 flex items-center gap-2">
-            <Check className="w-4 h-4" /> رمز عبور با موفقیت تغییر کرد.
-          </div>
-        )}
-        <div className="space-y-2">
-          <label className="text-[14px] font-semibold text-[#0F172A]">رمز عبور فعلی</label>
-          <Input type="password" required value={oldPassword} onChange={(e) => setOldPassword(e.target.value)} />
-        </div>
-        <div className="space-y-2">
-          <label className="text-[14px] font-semibold text-[#0F172A]">رمز عبور جدید</label>
-          <Input type="password" required value={newPassword} onChange={(e) => setNewPassword(e.target.value)} />
-        </div>
-        <div className="space-y-2">
-          <label className="text-[14px] font-semibold text-[#0F172A]">تکرار رمز عبور جدید</label>
-          <Input type="password" required value={confirmPassword} onChange={(e) => setConfirmPassword(e.target.value)} />
-        </div>
-        <Button type="submit" className="w-full" disabled={isSaving}>
-          {isSaving ? <Loader2 className="w-5 h-5 animate-spin" /> : "ذخیره رمز جدید"}
-        </Button>
-      </form>
+    <div className="bg-white border border-black/5 rounded-2xl p-5">
+      <p className="text-[13px] text-[#64748B] font-medium mb-1">{label}</p>
+      <p className="text-[26px] font-extrabold text-[#0F172A]">{value}</p>
     </div>
   );
 }
