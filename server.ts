@@ -2,6 +2,7 @@ import "dotenv/config";
 import express from "express";
 import cors from "cors";
 import path from "path";
+import crypto from "crypto";
 import rateLimit from "express-rate-limit";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI } from "@google/genai";
@@ -22,6 +23,9 @@ import {
   insertConsultation,
   saveConsultationResponse,
   getUserHistory,
+  getAllUsersWithStats,
+  getAllConsultationsWithUser,
+  getAdminStats,
   toPublicUser,
   type DbUser,
 } from "./db";
@@ -115,6 +119,24 @@ async function startServer() {
     if (!user) return res.status(401).json({ error: "نشست شما منقضی شده است، دوباره وارد شوید." });
 
     req.user = user;
+    next();
+  }
+
+  // === Admin middleware ===
+  // یک توکن ساده که فقط خودت می‌دانی؛ در Environment Variables ری‌ندر با نام
+  // ADMIN_EXPORT_TOKEN تعریفش کن (یک رشته‌ی تصادفی و طولانی دلخواه).
+  function requireAdmin(req: express.Request, res: express.Response, next: express.NextFunction) {
+    const expected = process.env.ADMIN_EXPORT_TOKEN;
+    if (!expected) {
+      return res.status(503).json({ error: "ADMIN_EXPORT_TOKEN تنظیم نشده است." });
+    }
+    const provided = ((req.query.token as string) ?? (req.headers["x-admin-token"] as string) ?? "");
+    const a = Buffer.from(provided);
+    const b = Buffer.from(expected);
+    const match = a.length === b.length && crypto.timingSafeEqual(a, b);
+    if (!match) {
+      return res.status(403).json({ error: "دسترسی غیرمجاز." });
+    }
     next();
   }
 
@@ -314,6 +336,95 @@ async function startServer() {
       res.write(`data: ${JSON.stringify({ error: "Internal AI error", details: e.message })}\n\n`);
       res.end();
     }
+  });
+
+  // === Admin: JSON (برای پنل ادمین) ===
+  app.get("/api/admin/stats", requireAdmin, async (req, res) => {
+    res.json(await getAdminStats());
+  });
+
+  app.get("/api/admin/users", requireAdmin, async (req, res) => {
+    const users = await getAllUsersWithStats();
+    res.json(
+      users.map((u) => ({
+        id: u.id,
+        firstName: u.first_name,
+        lastName: u.last_name,
+        fullName: u.full_name,
+        nationalCode: u.national_code,
+        phone: u.phone,
+        email: u.email,
+        role: u.role,
+        consultationCount: Number(u.consultation_count),
+        createdAt: u.created_at,
+      }))
+    );
+  });
+
+  app.get("/api/admin/activities", requireAdmin, async (req, res) => {
+    const rows = await getAllConsultationsWithUser();
+    res.json(
+      rows.map((c) => ({
+        id: c.id,
+        fullName: c.full_name,
+        phone: c.phone,
+        nationalCode: c.national_code,
+        title: c.title,
+        description: c.description,
+        response: c.response,
+        createdAt: c.created_at,
+      }))
+    );
+  });
+
+  // === Admin: خروجی CSV (برای دانلود) ===
+  function csvCell(value: unknown): string {
+    const s = value === null || value === undefined ? "" : String(value);
+    if (/[",\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+    return s;
+  }
+  function toCsv(headers: string[], rows: (string | number)[][]): string {
+    const lines = [headers.map(csvCell).join(","), ...rows.map((r) => r.map(csvCell).join(","))];
+    return "\uFEFF" + lines.join("\r\n"); // BOM تا اکسل فارسی را درست نشان دهد
+  }
+
+  app.get("/api/admin/export/users.csv", requireAdmin, async (req, res) => {
+    const users = await getAllUsersWithStats();
+    const csv = toCsv(
+      ["نام", "نام خانوادگی", "کد ملی", "شماره موبایل", "ایمیل", "نقش", "تعداد مشاوره‌ها", "تاریخ ثبت‌نام"],
+      users.map((u) => [
+        u.first_name ?? "",
+        u.last_name ?? "",
+        u.national_code ?? "",
+        u.phone ?? "",
+        u.email ?? "",
+        u.role,
+        u.consultation_count,
+        new Date(u.created_at).toLocaleString("fa-IR"),
+      ])
+    );
+    res.setHeader("Content-Type", "text/csv; charset=utf-8");
+    res.setHeader("Content-Disposition", `attachment; filename="users-${Date.now()}.csv"`);
+    res.send(csv);
+  });
+
+  app.get("/api/admin/export/activities.csv", requireAdmin, async (req, res) => {
+    const rows = await getAllConsultationsWithUser();
+    const csv = toCsv(
+      ["نام کاربر", "شماره موبایل", "کد ملی", "عنوان پرسش", "شرح پرسش", "پاسخ سامانه", "تاریخ"],
+      rows.map((c) => [
+        c.full_name,
+        c.phone ?? "",
+        c.national_code ?? "",
+        c.title,
+        c.description,
+        c.response ?? "",
+        new Date(c.created_at).toLocaleString("fa-IR"),
+      ])
+    );
+    res.setHeader("Content-Type", "text/csv; charset=utf-8");
+    res.setHeader("Content-Disposition", `attachment; filename="activities-${Date.now()}.csv"`);
+    res.send(csv);
   });
 
   // === Laws (public reference data) ===

@@ -97,6 +97,63 @@ export async function initDb() {
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);`);
 }
 
+// === Admin: users + activity overview ===
+
+export interface UserWithStats extends DbUser {
+  consultation_count: string; // pg برمی‌گرداند COUNT() به شکل رشته
+}
+
+export async function getAllUsersWithStats(): Promise<UserWithStats[]> {
+  const r = await pool.query(`
+    SELECT u.*, COUNT(c.id) AS consultation_count
+    FROM users u
+    LEFT JOIN consultations c ON c.user_id = u.id
+    GROUP BY u.id
+    ORDER BY u.created_at DESC
+  `);
+  return r.rows;
+}
+
+export interface ConsultationWithUser {
+  id: string;
+  full_name: string;
+  phone: string | null;
+  national_code: string | null;
+  title: string;
+  description: string;
+  response: string | null;
+  created_at: string;
+}
+
+export async function getAllConsultationsWithUser(): Promise<ConsultationWithUser[]> {
+  const r = await pool.query(`
+    SELECT c.id, u.full_name, u.phone, u.national_code,
+           c.title, c.description, c.response, c.created_at
+    FROM consultations c
+    JOIN users u ON u.id = c.user_id
+    ORDER BY c.created_at DESC
+  `);
+  return r.rows;
+}
+
+export interface AdminStats {
+  totalUsers: string;
+  totalConsultations: string;
+  usersLast7Days: string;
+  consultationsLast7Days: string;
+}
+
+export async function getAdminStats(): Promise<AdminStats> {
+  const r = await pool.query(`
+    SELECT
+      (SELECT COUNT(*) FROM users) AS "totalUsers",
+      (SELECT COUNT(*) FROM consultations) AS "totalConsultations",
+      (SELECT COUNT(*) FROM users WHERE created_at > now() - interval '7 days') AS "usersLast7Days",
+      (SELECT COUNT(*) FROM consultations WHERE created_at > now() - interval '7 days') AS "consultationsLast7Days"
+  `);
+  return r.rows[0];
+}
+
 // === Users ===
 
 export async function getUserByPhone(phone: string): Promise<DbUser | null> {
