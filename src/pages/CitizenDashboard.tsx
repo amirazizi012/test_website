@@ -6,7 +6,7 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import rehypeRaw from 'rehype-raw';
 import { Button } from "../components/ui/Button";
-import { getCurrentUser, logout } from "../lib/auth";
+import { getCurrentUser, logout, apiFetch } from "../lib/auth";
 
 const SIDEBAR_ITEMS = [
   { icon: Home, label: "داشبورد", active: false, path: "/dashboard/citizen" },
@@ -70,7 +70,7 @@ export default function CitizenDashboard() {
     setIsAsking(true);
 
     try {
-      const res = await fetch("/api/ai/stream", {
+      const res = await apiFetch("/api/ai/stream", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ 
@@ -78,6 +78,12 @@ export default function CitizenDashboard() {
           description: userMessage 
         })
       });
+
+      if (res.status === 401) {
+        setChatHistory(prev => [...prev, { role: 'ai', content: "نشست شما منقضی شده، لطفاً دوباره وارد حساب کاربری خود شوید.", timestamp: new Date().toLocaleTimeString('fa-IR', { hour: '2-digit', minute: '2-digit' }) }]);
+        setIsAsking(false);
+        return;
+      }
 
       if (!res.body) throw new Error("No response body");
 

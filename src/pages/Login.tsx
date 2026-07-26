@@ -5,6 +5,7 @@ import { Shield, ArrowRight, Loader2, KeyRound } from "lucide-react";
 import { Input } from "../components/ui/Input";
 import { Button } from "../components/ui/Button";
 import { saveSession } from "../lib/auth";
+import GoogleSignInButton from "../components/GoogleSignInButton";
 
 export default function Login() {
   const navigate = useNavigate();
@@ -124,6 +125,13 @@ export default function Login() {
               <Button type="submit" size="lg" className="w-full mt-4" disabled={isLoading || phone.length < 10}>
                 {isLoading ? <Loader2 className="w-6 h-6 animate-spin" /> : "دریافت کد تایید"}
               </Button>
+
+              <div className="pt-2">
+                <GoogleSignInButton
+                  onSuccess={() => navigate("/dashboard/citizen")}
+                  onError={(msg) => setError(msg)}
+                />
+              </div>
             </motion.form>
           )}
 

@@ -5,6 +5,7 @@ import { Shield, ArrowRight, Loader2, UserPlus } from "lucide-react";
 import { Input } from "../components/ui/Input";
 import { Button } from "../components/ui/Button";
 import { saveSession } from "../lib/auth";
+import GoogleSignInButton from "../components/GoogleSignInButton";
 
 export default function Register() {
   const navigate = useNavigate();
@@ -93,6 +94,13 @@ export default function Register() {
           <Button type="submit" size="lg" className="w-full mt-6" disabled={isLoading}>
             {isLoading ? <Loader2 className="w-6 h-6 animate-spin" /> : "تکمیل ثبت نام"}
           </Button>
+
+          <div className="pt-2">
+            <GoogleSignInButton
+              onSuccess={() => navigate("/dashboard/citizen")}
+              onError={(msg) => setError(msg)}
+            />
+          </div>
         </form>
 
         <div className="mt-8 text-center border-t border-black/5 pt-6">
