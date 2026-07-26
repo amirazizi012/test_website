@@ -2,7 +2,6 @@ import "dotenv/config";
 import express from "express";
 import cors from "cors";
 import path from "path";
-import crypto from "crypto";
 import rateLimit from "express-rate-limit";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI } from "@google/genai";
@@ -83,10 +82,7 @@ async function ensureAdminRole(user: DbUser): Promise<DbUser> {
   }
   return user;
 }
-// === متغیرهای مربوط به ورود ادمین با رمز ثابت ===
-let currentAdminPassword = process.env.ADMIN_PASSWORD || "admin";
-const adminSessions = new Set<string>(); // ذخیره توکن‌های ادمین
-const adminLoginAttempts = new Map<string, { count: number; lockedUntil: number }>();
+
 async function startServer() {
   await initDb();
 
@@ -138,14 +134,6 @@ async function startServer() {
     const header = req.headers.authorization ?? "";
     const token = header.startsWith("Bearer ") ? header.slice(7) : null;
     if (!token) return res.status(401).json({ error: "لطفاً ابتدا وارد حساب کاربری خود شوید." });
-
-    // --- بخش جدید: شناسایی توکنِ ادمین با رمز ثابت ---
-    if (adminSessions.has(token)) {
-      // ایجاد یک کاربر مجازی ادمین برای عبور از فیلترها بدون درگیر کردن دیتابیس
-      req.user = { id: "fixed-admin", role: "Admin", fullName: "مدیر سامانه", phone: "", nationalCode: "", email: "" } as any;
-      return next();
-    }
-    // ------------------------------------------------
 
     const user = await getUserBySessionToken(token);
     if (!user) return res.status(401).json({ error: "نشست شما منقضی شده است، دوباره وارد شوید." });
@@ -302,52 +290,6 @@ async function startServer() {
     const header = req.headers.authorization ?? "";
     const token = header.startsWith("Bearer ") ? header.slice(7) : null;
     if (token) await deleteSession(token);
-    res.json({ ok: true });
-  });
-
-  // === ورود ادمین با رمز ثابت (سازگار با فرانت‌اند) ===
-  app.post("/api/admin/login", authLimiter, (req, res) => {
-    const { password } = req.body ?? {};
-    const ip = req.ip || "unknown";
-    const attempt = adminLoginAttempts.get(ip);
-
-    // بررسی قفل بودن اکانت به دلیل تلاش زیاد
-    if (attempt && attempt.lockedUntil > Date.now()) {
-      const waitMin = Math.ceil((attempt.lockedUntil - Date.now()) / 60000);
-      return res.status(429).json({ error: `تعداد تلاش‌های ناموفق بیش از حد است. ${waitMin} دقیقه دیگر دوباره امتحان کنید.` });
-    }
-
-    // اگر رمز اشتباه بود
-    if (!password || password !== currentAdminPassword) {
-      const current = adminLoginAttempts.get(ip) ?? { count: 0, lockedUntil: 0 };
-      current.count += 1;
-      if (current.count >= 5) {
-        current.lockedUntil = Date.now() + 5 * 60 * 1000;
-        current.count = 0;
-      }
-      adminLoginAttempts.set(ip, current);
-      return res.status(401).json({ error: "رمز عبور نادرست است." });
-    }
-
-    // اگر ورود موفق بود
-    adminLoginAttempts.delete(ip);
-    const token = crypto.randomUUID();
-    adminSessions.add(token);
-    res.json({ token, isDefault: currentAdminPassword === "admin" });
-  });
-
-  // === تغییر رمز عبور ادمین ===
-  app.post("/api/admin/change-password", requireAuth, requireAdmin, (req, res) => {
-    const { oldPassword, newPassword } = req.body ?? {};
-    
-    if (oldPassword !== currentAdminPassword) {
-      return res.status(401).json({ error: "رمز عبور فعلی نادرست است." });
-    }
-    if (!newPassword || newPassword.length < 6) {
-      return res.status(400).json({ error: "رمز عبور جدید باید حداقل ۶ کاراکتر باشد." });
-    }
-
-    currentAdminPassword = newPassword;
     res.json({ ok: true });
   });
 
