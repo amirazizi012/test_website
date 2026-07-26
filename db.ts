@@ -212,6 +212,10 @@ export async function linkGoogleId(userId: string, googleId: string) {
   await pool.query("UPDATE users SET google_id = $1 WHERE id = $2", [googleId, userId]);
 }
 
+export async function setUserRole(userId: string, role: string) {
+  await pool.query("UPDATE users SET role = $1 WHERE id = $2", [role, userId]);
+}
+
 // === Sessions ===
 
 const SESSION_TTL_DAYS = 30;

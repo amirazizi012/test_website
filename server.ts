@@ -1,138 +1,54 @@
 import "dotenv/config";
 import express from "express";
-import type { Request, Response, NextFunction } from "express";
+import cors from "cors";
 import path from "path";
-import fs from "fs";
-import crypto from "crypto";
+import rateLimit from "express-rate-limit";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI } from "@google/genai";
+import { OAuth2Client } from "google-auth-library";
 
-const PORT = 3000;
+import { isValidIranianNationalCode } from "./nationalId";
+import {
+  initDb,
+  getUserByPhone,
+  getUserByNationalCode,
+  getUserByEmail,
+  getUserByGoogleId,
+  insertUser,
+  linkGoogleId,
+  createSession,
+  getUserBySessionToken,
+  deleteSession,
+  insertConsultation,
+  saveConsultationResponse,
+  getUserHistory,
+  getAllUsersWithStats,
+  getAllConsultationsWithUser,
+  getAdminStats,
+  setUserRole,
+  toPublicUser,
+  type DbUser,
+} from "./db";
 
-// === Real user persistence (JSON file) ===
-const DATA_DIR = path.join(process.cwd(), "data");
-const USERS_FILE = path.join(DATA_DIR, "users.json");
+const PORT = Number(process.env.PORT) || 3000;
 
-interface StoredUser {
-  id: string;
-  firstName: string;
-  lastName: string;
-  fullName: string;
-  nationalCode: string;
-  phone: string;
-  role: "Citizen";
-  createdAt: string;
-}
-
-function loadUsers(): StoredUser[] {
-  try {
-    if (!fs.existsSync(USERS_FILE)) return [];
-    return JSON.parse(fs.readFileSync(USERS_FILE, "utf-8"));
-  } catch (e) {
-    console.error("خطا در خواندن users.json:", e);
-    return [];
+// === Fail-fast: بدون این متغیرها سایت نباید بالا بیاید یا باید واضح هشدار بدهد ===
+const REQUIRED_ENV = ["DATABASE_URL"] as const;
+for (const key of REQUIRED_ENV) {
+  if (!process.env[key]) {
+    console.error(`❌ متغیر محیطی ${key} تنظیم نشده است. سرور اجرا نمی‌شود.`);
+    process.exit(1);
   }
 }
-
-function saveUsers(users: StoredUser[]) {
-  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-  fs.writeFileSync(USERS_FILE, JSON.stringify(users, null, 2), "utf-8");
+if (!process.env.GEMINI_API_KEY) {
+  console.warn("⚠️  GEMINI_API_KEY تنظیم نشده — مشاوره‌ی هوش مصنوعی کار نخواهد کرد.");
+}
+if (!process.env.GOOGLE_CLIENT_ID) {
+  console.warn("⚠️  GOOGLE_CLIENT_ID تنظیم نشده — ورود با گوگل غیرفعال خواهد بود.");
 }
 
-// کد تایید هر شماره موبایل: phone -> { code, expiresAt }
+// نشست‌های موقت OTP (فقط برای مرحله‌ی کوتاه ارسال/تایید کد، در حافظه کافی است)
 const otpStore = new Map<string, { code: string; expiresAt: number }>();
-
-// نشست‌های فعال شهروندان: token -> userId
-const sessions = new Map<string, string>();
-
-// === پنل مدیریت (کاملاً مجزا از سیستم OTP شهروندان) ===
-const ADMIN_FILE = path.join(DATA_DIR, "admin.json");
-const LAWS_FILE = path.join(DATA_DIR, "laws.json");
-
-interface AdminConfig {
-  passwordHash: string;
-  isDefault: boolean;
-}
-
-function hashPassword(password: string): string {
-  const salt = crypto.randomBytes(16).toString("hex");
-  const hash = crypto.scryptSync(password, salt, 64).toString("hex");
-  return `${salt}:${hash}`;
-}
-
-function verifyPassword(password: string, stored: string): boolean {
-  const [salt, hash] = (stored ?? "").split(":");
-  if (!salt || !hash) return false;
-  const hashVerify = crypto.scryptSync(password, salt, 64).toString("hex");
-  const a = Buffer.from(hash, "hex");
-  const b = Buffer.from(hashVerify, "hex");
-  if (a.length !== b.length) return false;
-  return crypto.timingSafeEqual(a, b);
-}
-
-function loadAdminConfig(): AdminConfig {
-  try {
-    if (!fs.existsSync(ADMIN_FILE)) {
-      const config: AdminConfig = { passwordHash: hashPassword("admin"), isDefault: true };
-      if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-      fs.writeFileSync(ADMIN_FILE, JSON.stringify(config, null, 2), "utf-8");
-      return config;
-    }
-    return JSON.parse(fs.readFileSync(ADMIN_FILE, "utf-8"));
-  } catch (e) {
-    console.error("خطا در خواندن admin.json:", e);
-    return { passwordHash: hashPassword("admin"), isDefault: true };
-  }
-}
-
-function saveAdminConfig(config: AdminConfig) {
-  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-  fs.writeFileSync(ADMIN_FILE, JSON.stringify(config, null, 2), "utf-8");
-}
-
-interface CrisisLawEntry {
-  id: string;
-  title: string;
-  category: string;
-  description: string;
-}
-
-function loadLaws(): CrisisLawEntry[] {
-  try {
-    if (!fs.existsSync(LAWS_FILE)) {
-      const defaults: CrisisLawEntry[] = [
-        { id: "1", title: "قانون مدیریت بحران کشور", category: "مدیریت بحران", description: "مصوب ۱۳۹۸، جهت سازماندهی و انسجام تیم‌های امدادی" },
-        { id: "2", title: "قانون بیمه همگانی", category: "حمایتی", description: "پوشش بیمه ای در برابر حوادث طبیعی مانند زلزله و سیل" },
-      ];
-      saveLaws(defaults);
-      return defaults;
-    }
-    return JSON.parse(fs.readFileSync(LAWS_FILE, "utf-8"));
-  } catch (e) {
-    console.error("خطا در خواندن laws.json:", e);
-    return [];
-  }
-}
-
-function saveLaws(laws: CrisisLawEntry[]) {
-  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-  fs.writeFileSync(LAWS_FILE, JSON.stringify(laws, null, 2), "utf-8");
-}
-
-// نشست‌های پنل مدیریت — کاملاً جدا از sessions شهروندان
-const adminSessions = new Map<string, boolean>();
-
-// جلوگیری ساده از حدس‌زدن رمز مدیر: بعد از ۵ تلاش ناموفق، ۵ دقیقه قفل
-const adminLoginAttempts = new Map<string, { count: number; lockedUntil: number }>();
-
-function authenticateAdmin(req: Request, res: Response, next: NextFunction) {
-  const header = req.headers.authorization;
-  const token = header?.startsWith("Bearer ") ? header.slice(7) : null;
-  if (!token || !adminSessions.has(token)) {
-    return res.status(401).json({ error: "دسترسی غیرمجاز. لطفاً وارد پنل مدیریت شوید." });
-  }
-  next();
-}
 
 let ai: GoogleGenAI | null = null;
 function getAI() {
@@ -144,75 +60,142 @@ function getAI() {
   return ai;
 }
 
+const googleClient = process.env.GOOGLE_CLIENT_ID
+  ? new OAuth2Client(process.env.GOOGLE_CLIENT_ID)
+  : null;
+
+// شماره‌موبایل‌ها/ایمیل‌هایی که در این متغیرهای محیطی باشند، خودکار نقش Admin می‌گیرند.
+// مثال در .env: ADMIN_PHONES=09121234567,09359999999
+const adminPhones = (process.env.ADMIN_PHONES ?? "")
+  .split(",").map((s) => s.trim()).filter(Boolean);
+const adminEmails = (process.env.ADMIN_EMAILS ?? "")
+  .split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
+
+async function ensureAdminRole(user: DbUser): Promise<DbUser> {
+  const shouldBeAdmin =
+    (!!user.phone && adminPhones.includes(user.phone)) ||
+    (!!user.email && adminEmails.includes(user.email.toLowerCase()));
+
+  if (shouldBeAdmin && user.role !== "Admin") {
+    await setUserRole(user.id, "Admin");
+    return { ...user, role: "Admin" };
+  }
+  return user;
+}
+
 async function startServer() {
+  await initDb();
+
   const app = express();
-
-  // Render (مثل هر PaaS دیگه) اپ شما را پشت یک reverse proxy اجرا می‌کند.
-  app.set("trust proxy", 1);
-
   app.use(express.json());
 
-  // === Mock DB (فقط برای پرسش/پاسخ‌ها؛ قوانین حالا واقعی و پایدار است) ===
-  const questions: any[] = [];
-  const responses: any[] = [];
+  // === CORS ===
+  // در حالت عادی فرانت و بک روی یک دامنه‌اند؛ FRONTEND_ORIGIN فقط برای حالتی است
+  // که فرانت را جدا (مثلاً روی Vercel) میزبانی کنید.
+  const allowedOrigin = process.env.FRONTEND_ORIGIN;
+  app.use(
+    cors({
+      origin: allowedOrigin ? allowedOrigin : true,
+      credentials: true,
+    })
+  );
 
-  // === API ROUTES ===
+  // === Rate limiting روی مسیرهای حساس/پرهزینه ===
+  const otpLimiter = rateLimit({
+    windowMs: 10 * 60 * 1000, // ۱۰ دقیقه
+    limit: 5,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: "تعداد درخواست‌های شما زیاد بوده، چند دقیقه دیگر دوباره تلاش کنید." },
+  });
 
+  const aiLimiter = rateLimit({
+    windowMs: 60 * 60 * 1000, // ۱ ساعت
+    limit: 30,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: "سقف تعداد درخواست‌های مشاوره‌ی هوش مصنوعی برای این ساعت پر شده است." },
+  });
+
+  const authLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    limit: 20,
+    standardHeaders: true,
+    legacyHeaders: false,
+  });
+
+  // === Auth middleware ===
+  interface AuthedRequest extends express.Request {
+    user?: DbUser;
+  }
+
+  async function requireAuth(req: AuthedRequest, res: express.Response, next: express.NextFunction) {
+    const header = req.headers.authorization ?? "";
+    const token = header.startsWith("Bearer ") ? header.slice(7) : null;
+    if (!token) return res.status(401).json({ error: "لطفاً ابتدا وارد حساب کاربری خود شوید." });
+
+    const user = await getUserBySessionToken(token);
+    if (!user) return res.status(401).json({ error: "نشست شما منقضی شده است، دوباره وارد شوید." });
+
+    req.user = user;
+    next();
+  }
+
+  async function requireAdmin(req: AuthedRequest, res: express.Response, next: express.NextFunction) {
+    if (!req.user || req.user.role !== "Admin") {
+      return res.status(403).json({ error: "دسترسی فقط برای مدیر سامانه مجاز است." });
+    }
+    next();
+  }
+
+  // === Health ===
   app.get("/api/health", (req, res) => {
     res.json({ status: "ok" });
   });
 
-  // === Real Auth (شهروندان) — بدون هیچ تغییری ===
-
-  app.post("/api/auth/register", (req, res) => {
+  // === ثبت‌نام با شماره موبایل ===
+  app.post("/api/auth/register", authLimiter, async (req, res) => {
     const { firstName, lastName, nationalCode, phone } = req.body ?? {};
 
     if (!firstName?.trim() || !lastName?.trim() || !nationalCode?.trim() || !phone?.trim()) {
       return res.status(400).json({ error: "تکمیل تمام فیلدها الزامی است." });
     }
-    if (!/^\d{10}$/.test(nationalCode)) {
-      return res.status(400).json({ error: "کد ملی باید دقیقاً ۱۰ رقم باشد." });
+    if (!isValidIranianNationalCode(nationalCode)) {
+      return res.status(400).json({ error: "کد ملی وارد شده معتبر نیست." });
     }
     if (!/^09\d{9}$/.test(phone)) {
       return res.status(400).json({ error: "شماره موبایل معتبر نیست (مثال: 09123456789)." });
     }
 
-    const users = loadUsers();
-    if (users.some((u) => u.phone === phone)) {
+    if (await getUserByPhone(phone)) {
       return res.status(409).json({ error: "کاربری با این شماره موبایل قبلاً ثبت‌نام کرده است." });
     }
-    if (users.some((u) => u.nationalCode === nationalCode)) {
+    if (await getUserByNationalCode(nationalCode)) {
       return res.status(409).json({ error: "کاربری با این کد ملی قبلاً ثبت‌نام کرده است." });
     }
 
-    const user: StoredUser = {
-      id: crypto.randomUUID(),
+    let user = await insertUser({
       firstName: firstName.trim(),
       lastName: lastName.trim(),
       fullName: `${firstName.trim()} ${lastName.trim()}`,
       nationalCode,
       phone,
-      role: "Citizen",
-      createdAt: new Date().toISOString(),
-    };
+    });
+    user = await ensureAdminRole(user);
 
-    users.push(user);
-    saveUsers(users);
-
-    const token = crypto.randomUUID();
-    sessions.set(token, user.id);
-
-    res.status(201).json({ token, user });
+    const token = await createSession(user.id);
+    res.status(201).json({ token, user: toPublicUser(user) });
   });
 
-  app.post("/api/auth/otp/send", (req, res) => {
+  // === ورود مرحله ۱: ارسال کد تایید ===
+  // توجه: چون سرویس پیامک واقعی وصل نیست، کد فعلاً فقط در لاگ سرور و (در dev) در پاسخ چاپ می‌شود.
+  app.post("/api/auth/otp/send", otpLimiter, async (req, res) => {
     const { phone } = req.body ?? {};
     if (!/^09\d{9}$/.test(phone ?? "")) {
       return res.status(400).json({ error: "شماره موبایل معتبر نیست." });
     }
 
-    const users = loadUsers();
-    const user = users.find((u) => u.phone === phone);
+    const user = await getUserByPhone(phone);
     if (!user) {
       return res.status(404).json({ error: "کاربری با این شماره موبایل یافت نشد. ابتدا ثبت‌نام کنید." });
     }
@@ -220,7 +203,7 @@ async function startServer() {
     const code = Math.floor(1000 + Math.random() * 9000).toString();
     otpStore.set(phone, { code, expiresAt: Date.now() + 2 * 60 * 1000 });
 
-    // TODO: این بخش باید در نسخه واقعی با یک سرویس پیامک (کاوه‌نگار، ملی‌پیامک و ...) جایگزین شود.
+    // TODO: این بخش باید در آینده با یک سرویس پیامک واقعی (کاوه‌نگار، ملی‌پیامک و ...) جایگزین شود.
     console.log(`[OTP] کد ورود برای ${phone}: ${code}`);
 
     res.json({
@@ -229,7 +212,8 @@ async function startServer() {
     });
   });
 
-  app.post("/api/auth/otp/verify", (req, res) => {
+  // === ورود مرحله ۲: بررسی کد ===
+  app.post("/api/auth/otp/verify", otpLimiter, async (req, res) => {
     const { phone, otp } = req.body ?? {};
     const entry = otpStore.get(phone);
 
@@ -241,128 +225,129 @@ async function startServer() {
     }
     otpStore.delete(phone);
 
-    const users = loadUsers();
-    const user = users.find((u) => u.phone === phone);
+    let user = await getUserByPhone(phone);
     if (!user) {
       return res.status(404).json({ error: "کاربری با این شماره موبایل یافت نشد." });
     }
+    user = await ensureAdminRole(user);
 
-    const token = crypto.randomUUID();
-    sessions.set(token, user.id);
-    res.json({ token, user });
+    const token = await createSession(user.id);
+    res.json({ token, user: toPublicUser(user) });
   });
 
-  // === پنل مدیریت (جدید) ===
-
-  app.post("/api/admin/login", (req, res) => {
-    const { password } = req.body ?? {};
-    const ip = req.ip || "unknown";
-    const attempt = adminLoginAttempts.get(ip);
-
-    if (attempt && attempt.lockedUntil > Date.now()) {
-      const waitMin = Math.ceil((attempt.lockedUntil - Date.now()) / 60000);
-      return res.status(429).json({ error: `تعداد تلاش‌های ناموفق بیش از حد است. ${waitMin} دقیقه دیگر دوباره امتحان کنید.` });
-    }
-
-    if (!password) {
-      return res.status(400).json({ error: "رمز عبور الزامی است." });
-    }
-
-    const config = loadAdminConfig();
-    if (!verifyPassword(password, config.passwordHash)) {
-      const current = adminLoginAttempts.get(ip) ?? { count: 0, lockedUntil: 0 };
-      current.count += 1;
-      if (current.count >= 5) {
-        current.lockedUntil = Date.now() + 5 * 60 * 1000;
-        current.count = 0;
+  // === ورود/ثبت‌نام با گوگل ===
+  // فرانت با Google Identity Services یک id_token (credential) می‌گیرد و اینجا می‌فرستد.
+  app.post("/api/auth/google", authLimiter, async (req, res) => {
+    try {
+      if (!googleClient) {
+        return res.status(500).json({ error: "ورود با گوگل روی این سرور فعال نیست." });
       }
-      adminLoginAttempts.set(ip, current);
-      return res.status(401).json({ error: "رمز عبور نادرست است." });
-    }
+      const { credential } = req.body ?? {};
+      if (!credential) {
+        return res.status(400).json({ error: "توکن گوگل ارسال نشده است." });
+      }
 
-    adminLoginAttempts.delete(ip);
-    const token = crypto.randomUUID();
-    adminSessions.set(token, true);
-    res.json({ token, isDefault: config.isDefault });
+      const ticket = await googleClient.verifyIdToken({
+        idToken: credential,
+        audience: process.env.GOOGLE_CLIENT_ID,
+      });
+      const payload = ticket.getPayload();
+      if (!payload?.email) {
+        return res.status(400).json({ error: "دریافت ایمیل از حساب گوگل ممکن نشد." });
+      }
+
+      let user = (await getUserByGoogleId(payload.sub)) ?? (await getUserByEmail(payload.email));
+
+      if (!user) {
+        user = await insertUser({
+          firstName: payload.given_name ?? "",
+          lastName: payload.family_name ?? "",
+          fullName: payload.name ?? payload.email,
+          email: payload.email,
+          googleId: payload.sub,
+        });
+      } else if (!user.google_id) {
+        await linkGoogleId(user.id, payload.sub);
+      }
+      user = await ensureAdminRole(user);
+
+      const token = await createSession(user.id);
+      res.json({ token, user: toPublicUser(user) });
+    } catch (e: any) {
+      console.error("خطای ورود با گوگل:", e.message);
+      res.status(401).json({ error: "احراز هویت گوگل ناموفق بود." });
+    }
   });
 
-  app.post("/api/admin/change-password", authenticateAdmin, (req, res) => {
-    const { oldPassword, newPassword } = req.body ?? {};
-    const config = loadAdminConfig();
+  // === اطلاعات کاربر لاگین‌شده ===
+  app.get("/api/me", requireAuth, (req: AuthedRequest, res) => {
+    res.json({ user: toPublicUser(req.user!) });
+  });
 
-    if (!verifyPassword(oldPassword ?? "", config.passwordHash)) {
-      return res.status(401).json({ error: "رمز عبور فعلی نادرست است." });
-    }
-    if (!newPassword || newPassword.length < 6) {
-      return res.status(400).json({ error: "رمز عبور جدید باید حداقل ۶ کاراکتر باشد." });
-    }
-
-    saveAdminConfig({ passwordHash: hashPassword(newPassword), isDefault: false });
+  // === خروج ===
+  app.post("/api/auth/logout", requireAuth, async (req: AuthedRequest, res) => {
+    const header = req.headers.authorization ?? "";
+    const token = header.startsWith("Bearer ") ? header.slice(7) : null;
+    if (token) await deleteSession(token);
     res.json({ ok: true });
   });
 
-  app.get("/api/admin/stats", authenticateAdmin, (req, res) => {
+  // === تاریخچه‌ی سوالات/مشاوره‌های کاربر ===
+  app.get("/api/history", requireAuth, async (req: AuthedRequest, res) => {
+    const history = await getUserHistory(req.user!.id);
+    res.json({ history });
+  });
+
+  // === پنل ادمین: آمار کلی ===
+  app.get("/api/admin/stats", requireAuth, requireAdmin, async (req: AuthedRequest, res) => {
+    const stats = await getAdminStats();
+    res.json({ stats });
+  });
+
+  // === پنل ادمین: لیست همه‌ی کاربران با تعداد فعالیت ===
+  app.get("/api/admin/users", requireAuth, requireAdmin, async (req: AuthedRequest, res) => {
+    const users = await getAllUsersWithStats();
     res.json({
-      usersCount: loadUsers().length,
-      questionsCount: questions.length,
-      lawsCount: loadLaws().length,
+      users: users.map((u) => ({
+        ...toPublicUser(u),
+        consultationCount: parseInt(u.consultation_count, 10) || 0,
+      })),
     });
   });
 
-  app.get("/api/admin/users", authenticateAdmin, (req, res) => {
-    res.json(loadUsers());
+  // === پنل ادمین: تاریخچه‌ی کامل یک کاربر خاص ===
+  app.get("/api/admin/users/:id/history", requireAuth, requireAdmin, async (req: AuthedRequest, res) => {
+    const history = await getUserHistory(req.params.id, 200);
+    res.json({ history });
   });
 
-  app.get("/api/admin/laws", authenticateAdmin, (req, res) => {
-    res.json(loadLaws());
+  // === پنل ادمین: فید کامل فعالیت‌های همه‌ی کاربران (از اول تا الان) ===
+  app.get("/api/admin/consultations", requireAuth, requireAdmin, async (req: AuthedRequest, res) => {
+    const consultations = await getAllConsultationsWithUser();
+    res.json({ consultations });
   });
 
-  app.post("/api/admin/laws", authenticateAdmin, (req, res) => {
-    const { title, category, description } = req.body ?? {};
-    if (!title?.trim() || !category?.trim() || !description?.trim()) {
-      return res.status(400).json({ error: "تکمیل تمام فیلدها الزامی است." });
+  // === پنل ادمین: تغییر نقش یک کاربر (ارتقا به مدیر یا بازگرداندن به شهروند) ===
+  app.post("/api/admin/users/:id/role", requireAuth, requireAdmin, async (req: AuthedRequest, res) => {
+    const { role } = req.body ?? {};
+    if (role !== "Admin" && role !== "Citizen") {
+      return res.status(400).json({ error: "نقش نامعتبر است." });
     }
-    const laws = loadLaws();
-    const newLaw: CrisisLawEntry = {
-      id: crypto.randomUUID(),
-      title: title.trim(),
-      category: category.trim(),
-      description: description.trim(),
-    };
-    laws.push(newLaw);
-    saveLaws(laws);
-    res.status(201).json(newLaw);
-  });
-
-  app.put("/api/admin/laws/:id", authenticateAdmin, (req, res) => {
-    const { title, category, description } = req.body ?? {};
-    const laws = loadLaws();
-    const law = laws.find((l) => l.id === req.params.id);
-    if (!law) return res.status(404).json({ error: "قانون یافت نشد." });
-    if (title?.trim()) law.title = title.trim();
-    if (category?.trim()) law.category = category.trim();
-    if (description?.trim()) law.description = description.trim();
-    saveLaws(laws);
-    res.json(law);
-  });
-
-  app.delete("/api/admin/laws/:id", authenticateAdmin, (req, res) => {
-    const laws = loadLaws();
-    const filtered = laws.filter((l) => l.id !== req.params.id);
-    if (filtered.length === laws.length) return res.status(404).json({ error: "قانون یافت نشد." });
-    saveLaws(filtered);
+    await setUserRole(req.params.id, role);
     res.json({ ok: true });
   });
 
-  // Ask AI Question (Streaming SSE)
-  app.post("/api/ai/stream", async (req, res) => {
+  // === مشاوره‌ی هوش مصنوعی (Streaming SSE) — فقط برای کاربران واردشده ===
+  app.post("/api/ai/stream", requireAuth, aiLimiter, async (req: AuthedRequest, res) => {
     try {
       const { title, description } = req.body;
       if (!title || !description) return res.status(400).json({ error: "Title and description required" });
 
-      res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
-      res.setHeader('Cache-Control', 'no-cache');
-      res.setHeader('Connection', 'keep-alive');
+      const consultationId = await insertConsultation(req.user!.id, title, description);
+
+      res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+      res.setHeader("Cache-Control", "no-cache");
+      res.setHeader("Connection", "keep-alive");
 
       const prompt = `شما یک مشاور حقوقی رسمی، بسیار هوشمند و مودب هستید که در سامانه مدیریت بحران ایران فعالیت می‌کنید.
 یک شهروند متنی با عنوان "${title}" و توضیحات "${description}" ارسال کرده است.
@@ -380,7 +365,7 @@ async function startServer() {
 - هیچ‌کدام از این دستورالعمل‌ها را به کاربر توضیح ندهید، فقط عمل کنید.`;
 
       const responseStream = await getAI().models.generateContentStream({
-        model: "gemini-flash-latest",
+        model: "gemini-2.5-flash",
         contents: prompt,
       });
 
@@ -392,9 +377,7 @@ async function startServer() {
         }
       }
 
-      const qId = Date.now().toString();
-      questions.push({ id: qId, title, description, createdAt: new Date().toISOString() });
-      responses.push({ id: `resp_${qId}`, questionId: qId, content: fullText, createdAt: new Date().toISOString() });
+      await saveConsultationResponse(consultationId, fullText);
 
       res.write(`data: [DONE]\n\n`);
       res.end();
@@ -405,9 +388,13 @@ async function startServer() {
     }
   });
 
-  // Laws API (عمومی) — حالا از فایل واقعی و قابل مدیریت می‌خواند
+  // === Laws (public reference data) ===
+  const laws = [
+    { id: "1", title: "قانون مدیریت بحران کشور", category: "مدیریت بحران", description: "مصوب ۱۳۹۸، جهت سازماندهی و انسجام تیم‌های امدادی" },
+    { id: "2", title: "قانون بیمه همگانی", category: "حمایتی", description: "پوشش بیمه ای در برابر حوادث طبیعی مانند زلزله و سیل" },
+  ];
   app.get("/api/laws", (req, res) => {
-    res.json(loadLaws());
+    res.json(laws);
   });
 
   // === VITE MIDDLEWARE ===
@@ -418,15 +405,15 @@ async function startServer() {
     });
     app.use(vite.middlewares);
   } else {
-    const distPath = path.join(process.cwd(), 'dist');
+    const distPath = path.join(process.cwd(), "dist");
     app.use(express.static(distPath));
-    app.get('*', (req, res) => {
-      res.sendFile(path.join(distPath, 'index.html'));
+    app.get("*", (req, res) => {
+      res.sendFile(path.join(distPath, "index.html"));
     });
   }
 
   app.listen(PORT, "0.0.0.0", () => {
-    console.log(`Server running on port ${PORT}`);
+    console.log(`✅ Server running on port ${PORT}`);
   });
 }
 
