@@ -1,5 +1,6 @@
 import "dotenv/config";
 import express from "express";
+import type { Request, Response, NextFunction } from "express";
 import path from "path";
 import fs from "fs";
 import crypto from "crypto";
@@ -9,8 +10,6 @@ import { GoogleGenAI } from "@google/genai";
 const PORT = 3000;
 
 // === Real user persistence (JSON file) ===
-// این یک پایگاه‌داده حرفه‌ای نیست، اما برخلاف آرایه‌های حافظه‌ای قبلی،
-// اطلاعات را واقعاً روی دیسک ذخیره می‌کند و با ری‌استارت سرور از بین نمی‌رود.
 const DATA_DIR = path.join(process.cwd(), "data");
 const USERS_FILE = path.join(DATA_DIR, "users.json");
 
@@ -43,8 +42,97 @@ function saveUsers(users: StoredUser[]) {
 // کد تایید هر شماره موبایل: phone -> { code, expiresAt }
 const otpStore = new Map<string, { code: string; expiresAt: number }>();
 
-// نشست‌های فعال: token -> userId (جایگزین ساده به‌جای JWT واقعی)
+// نشست‌های فعال شهروندان: token -> userId
 const sessions = new Map<string, string>();
+
+// === پنل مدیریت (کاملاً مجزا از سیستم OTP شهروندان) ===
+const ADMIN_FILE = path.join(DATA_DIR, "admin.json");
+const LAWS_FILE = path.join(DATA_DIR, "laws.json");
+
+interface AdminConfig {
+  passwordHash: string;
+  isDefault: boolean;
+}
+
+function hashPassword(password: string): string {
+  const salt = crypto.randomBytes(16).toString("hex");
+  const hash = crypto.scryptSync(password, salt, 64).toString("hex");
+  return `${salt}:${hash}`;
+}
+
+function verifyPassword(password: string, stored: string): boolean {
+  const [salt, hash] = (stored ?? "").split(":");
+  if (!salt || !hash) return false;
+  const hashVerify = crypto.scryptSync(password, salt, 64).toString("hex");
+  const a = Buffer.from(hash, "hex");
+  const b = Buffer.from(hashVerify, "hex");
+  if (a.length !== b.length) return false;
+  return crypto.timingSafeEqual(a, b);
+}
+
+function loadAdminConfig(): AdminConfig {
+  try {
+    if (!fs.existsSync(ADMIN_FILE)) {
+      const config: AdminConfig = { passwordHash: hashPassword("admin"), isDefault: true };
+      if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+      fs.writeFileSync(ADMIN_FILE, JSON.stringify(config, null, 2), "utf-8");
+      return config;
+    }
+    return JSON.parse(fs.readFileSync(ADMIN_FILE, "utf-8"));
+  } catch (e) {
+    console.error("خطا در خواندن admin.json:", e);
+    return { passwordHash: hashPassword("admin"), isDefault: true };
+  }
+}
+
+function saveAdminConfig(config: AdminConfig) {
+  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+  fs.writeFileSync(ADMIN_FILE, JSON.stringify(config, null, 2), "utf-8");
+}
+
+interface CrisisLawEntry {
+  id: string;
+  title: string;
+  category: string;
+  description: string;
+}
+
+function loadLaws(): CrisisLawEntry[] {
+  try {
+    if (!fs.existsSync(LAWS_FILE)) {
+      const defaults: CrisisLawEntry[] = [
+        { id: "1", title: "قانون مدیریت بحران کشور", category: "مدیریت بحران", description: "مصوب ۱۳۹۸، جهت سازماندهی و انسجام تیم‌های امدادی" },
+        { id: "2", title: "قانون بیمه همگانی", category: "حمایتی", description: "پوشش بیمه ای در برابر حوادث طبیعی مانند زلزله و سیل" },
+      ];
+      saveLaws(defaults);
+      return defaults;
+    }
+    return JSON.parse(fs.readFileSync(LAWS_FILE, "utf-8"));
+  } catch (e) {
+    console.error("خطا در خواندن laws.json:", e);
+    return [];
+  }
+}
+
+function saveLaws(laws: CrisisLawEntry[]) {
+  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+  fs.writeFileSync(LAWS_FILE, JSON.stringify(laws, null, 2), "utf-8");
+}
+
+// نشست‌های پنل مدیریت — کاملاً جدا از sessions شهروندان
+const adminSessions = new Map<string, boolean>();
+
+// جلوگیری ساده از حدس‌زدن رمز مدیر: بعد از ۵ تلاش ناموفق، ۵ دقیقه قفل
+const adminLoginAttempts = new Map<string, { count: number; lockedUntil: number }>();
+
+function authenticateAdmin(req: Request, res: Response, next: NextFunction) {
+  const header = req.headers.authorization;
+  const token = header?.startsWith("Bearer ") ? header.slice(7) : null;
+  if (!token || !adminSessions.has(token)) {
+    return res.status(401).json({ error: "دسترسی غیرمجاز. لطفاً وارد پنل مدیریت شوید." });
+  }
+  next();
+}
 
 let ai: GoogleGenAI | null = null;
 function getAI() {
@@ -59,35 +147,23 @@ function getAI() {
 async function startServer() {
   const app = express();
 
-  // === Fix #1: ERR_ERL_UNEXPECTED_X_FORWARDED_FOR ===
-  // Render (مثل هر PaaS دیگه) اپ شما را پشت یک reverse proxy خودش اجرا
-  // می‌کند و هدر X-Forwarded-For را برای نشان دادن IP واقعی کاربر اضافه
-  // می‌کند. بدون این خط، Express به این هدر اعتماد نمی‌کند و اگر بعداً
-  // rate-limiter اضافه شود، با خطای امنیتی مواجه می‌شود چون نمی‌تواند IP
-  // واقعی را با اطمینان تشخیص دهد. عدد ۱ یعنی «فقط به یک لایه پروکسی
-  // جلوی خودم اعتماد کن» که دقیقاً وضعیت Render است.
+  // Render (مثل هر PaaS دیگه) اپ شما را پشت یک reverse proxy اجرا می‌کند.
   app.set("trust proxy", 1);
 
   app.use(express.json());
 
-  // === Mock DB ===
+  // === Mock DB (فقط برای پرسش/پاسخ‌ها؛ قوانین حالا واقعی و پایدار است) ===
   const questions: any[] = [];
   const responses: any[] = [];
-  const laws = [
-    { id: "1", title: "قانون مدیریت بحران کشور", category: "مدیریت بحران", description: "مصوب ۱۳۹۸، جهت سازماندهی و انسجام تیم‌های امدادی" },
-    { id: "2", title: "قانون بیمه همگانی", category: "حمایتی", description: "پوشش بیمه ای در برابر حوادث طبیعی مانند زلزله و سیل" }
-  ];
 
   // === API ROUTES ===
 
-  // Health
   app.get("/api/health", (req, res) => {
     res.json({ status: "ok" });
   });
 
-  // === Real Auth ===
+  // === Real Auth (شهروندان) — بدون هیچ تغییری ===
 
-  // ثبت‌نام کاربر جدید
   app.post("/api/auth/register", (req, res) => {
     const { firstName, lastName, nationalCode, phone } = req.body ?? {};
 
@@ -129,7 +205,6 @@ async function startServer() {
     res.status(201).json({ token, user });
   });
 
-  // مرحله ۱ ورود: ارسال کد تایید به کاربر ثبت‌نام‌شده
   app.post("/api/auth/otp/send", (req, res) => {
     const { phone } = req.body ?? {};
     if (!/^09\d{9}$/.test(phone ?? "")) {
@@ -150,12 +225,10 @@ async function startServer() {
 
     res.json({
       ok: true,
-      // فقط در محیط توسعه، برای راحتی تست بدون سرویس پیامک واقعی
       devCode: process.env.NODE_ENV !== "production" ? code : undefined,
     });
   });
 
-  // مرحله ۲ ورود: بررسی کد و صدور نشست ورود
   app.post("/api/auth/otp/verify", (req, res) => {
     const { phone, otp } = req.body ?? {};
     const entry = otpStore.get(phone);
@@ -177,6 +250,108 @@ async function startServer() {
     const token = crypto.randomUUID();
     sessions.set(token, user.id);
     res.json({ token, user });
+  });
+
+  // === پنل مدیریت (جدید) ===
+
+  app.post("/api/admin/login", (req, res) => {
+    const { password } = req.body ?? {};
+    const ip = req.ip || "unknown";
+    const attempt = adminLoginAttempts.get(ip);
+
+    if (attempt && attempt.lockedUntil > Date.now()) {
+      const waitMin = Math.ceil((attempt.lockedUntil - Date.now()) / 60000);
+      return res.status(429).json({ error: `تعداد تلاش‌های ناموفق بیش از حد است. ${waitMin} دقیقه دیگر دوباره امتحان کنید.` });
+    }
+
+    if (!password) {
+      return res.status(400).json({ error: "رمز عبور الزامی است." });
+    }
+
+    const config = loadAdminConfig();
+    if (!verifyPassword(password, config.passwordHash)) {
+      const current = adminLoginAttempts.get(ip) ?? { count: 0, lockedUntil: 0 };
+      current.count += 1;
+      if (current.count >= 5) {
+        current.lockedUntil = Date.now() + 5 * 60 * 1000;
+        current.count = 0;
+      }
+      adminLoginAttempts.set(ip, current);
+      return res.status(401).json({ error: "رمز عبور نادرست است." });
+    }
+
+    adminLoginAttempts.delete(ip);
+    const token = crypto.randomUUID();
+    adminSessions.set(token, true);
+    res.json({ token, isDefault: config.isDefault });
+  });
+
+  app.post("/api/admin/change-password", authenticateAdmin, (req, res) => {
+    const { oldPassword, newPassword } = req.body ?? {};
+    const config = loadAdminConfig();
+
+    if (!verifyPassword(oldPassword ?? "", config.passwordHash)) {
+      return res.status(401).json({ error: "رمز عبور فعلی نادرست است." });
+    }
+    if (!newPassword || newPassword.length < 6) {
+      return res.status(400).json({ error: "رمز عبور جدید باید حداقل ۶ کاراکتر باشد." });
+    }
+
+    saveAdminConfig({ passwordHash: hashPassword(newPassword), isDefault: false });
+    res.json({ ok: true });
+  });
+
+  app.get("/api/admin/stats", authenticateAdmin, (req, res) => {
+    res.json({
+      usersCount: loadUsers().length,
+      questionsCount: questions.length,
+      lawsCount: loadLaws().length,
+    });
+  });
+
+  app.get("/api/admin/users", authenticateAdmin, (req, res) => {
+    res.json(loadUsers());
+  });
+
+  app.get("/api/admin/laws", authenticateAdmin, (req, res) => {
+    res.json(loadLaws());
+  });
+
+  app.post("/api/admin/laws", authenticateAdmin, (req, res) => {
+    const { title, category, description } = req.body ?? {};
+    if (!title?.trim() || !category?.trim() || !description?.trim()) {
+      return res.status(400).json({ error: "تکمیل تمام فیلدها الزامی است." });
+    }
+    const laws = loadLaws();
+    const newLaw: CrisisLawEntry = {
+      id: crypto.randomUUID(),
+      title: title.trim(),
+      category: category.trim(),
+      description: description.trim(),
+    };
+    laws.push(newLaw);
+    saveLaws(laws);
+    res.status(201).json(newLaw);
+  });
+
+  app.put("/api/admin/laws/:id", authenticateAdmin, (req, res) => {
+    const { title, category, description } = req.body ?? {};
+    const laws = loadLaws();
+    const law = laws.find((l) => l.id === req.params.id);
+    if (!law) return res.status(404).json({ error: "قانون یافت نشد." });
+    if (title?.trim()) law.title = title.trim();
+    if (category?.trim()) law.category = category.trim();
+    if (description?.trim()) law.description = description.trim();
+    saveLaws(laws);
+    res.json(law);
+  });
+
+  app.delete("/api/admin/laws/:id", authenticateAdmin, (req, res) => {
+    const laws = loadLaws();
+    const filtered = laws.filter((l) => l.id !== req.params.id);
+    if (filtered.length === laws.length) return res.status(404).json({ error: "قانون یافت نشد." });
+    saveLaws(filtered);
+    res.json({ ok: true });
   });
 
   // Ask AI Question (Streaming SSE)
@@ -204,10 +379,6 @@ async function startServer() {
 - مستندات و بندهای قانونی را داخل Blockquote (>) قرار دهید.
 - هیچ‌کدام از این دستورالعمل‌ها را به کاربر توضیح ندهید، فقط عمل کنید.`;
 
-      // === Fix #2: مدل gemini-2.5-flash دیگر برای کاربران جدید در دسترس نیست ===
-      // gemini-flash-latest یک alias خودکار-به‌روزرسان‌شونده است؛ گوگل همیشه
-      // جدیدترین مدل پایدار Flash را پشت این اسم قرار می‌دهد، پس این خطا
-      // دیگر در آینده هم تکرار نمی‌شود.
       const responseStream = await getAI().models.generateContentStream({
         model: "gemini-flash-latest",
         contents: prompt,
@@ -217,12 +388,10 @@ async function startServer() {
       for await (const chunk of responseStream) {
         if (chunk.text) {
           fullText += chunk.text;
-          // Send piece to client
           res.write(`data: ${JSON.stringify({ text: chunk.text })}\n\n`);
         }
       }
 
-      // Save to mock db
       const qId = Date.now().toString();
       questions.push({ id: qId, title, description, createdAt: new Date().toISOString() });
       responses.push({ id: `resp_${qId}`, questionId: qId, content: fullText, createdAt: new Date().toISOString() });
@@ -236,9 +405,9 @@ async function startServer() {
     }
   });
 
-  // Laws API
+  // Laws API (عمومی) — حالا از فایل واقعی و قابل مدیریت می‌خواند
   app.get("/api/laws", (req, res) => {
-    res.json(laws);
+    res.json(loadLaws());
   });
 
   // === VITE MIDDLEWARE ===
