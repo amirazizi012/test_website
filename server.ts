@@ -54,7 +54,7 @@ import {
 const PORT = 3000;
 
 // کد تایید هر شماره موبایل: phone -> { code, expiresAt } — کوتاه‌مدت است، در حافظه کافی است
-const otpStore = new Map<string, { code: string; expiresAt: number }>();
+//const otpStore = new Map<string, { code: string; expiresAt: number }>();
 
 // جلوگیری ساده از حدس‌زدن رمز مدیر: بعد از ۵ تلاش ناموفق، ۵ دقیقه قفل
 const adminLoginAttempts = new Map<string, { count: number; lockedUntil: number }>();
@@ -205,59 +205,8 @@ async function startServer() {
     }
   });
 
-  app.post("/api/auth/otp/send", async (req, res) => {
-    try {
-      const { phone } = req.body ?? {};
-      if (!/^09\d{9}$/.test(phone ?? "")) {
-        return res.status(400).json({ error: "شماره موبایل معتبر نیست." });
-      }
-      const user = await findUserByPhone(phone);
-      if (!user) {
-        return res.status(404).json({ error: "کاربری با این شماره موبایل یافت نشد. ابتدا ثبت‌نام کنید." });
-      }
+ /// app.post("/api/auth/otp/send", async (req, res) => {
 
-      const code = Math.floor(1000 + Math.random() * 9000).toString();
-      otpStore.set(phone, { code, expiresAt: Date.now() + 2 * 60 * 1000 });
-
-      // TODO: این بخش باید در نسخه واقعی با یک سرویس پیامک (کاوه‌نگار، ملی‌پیامک و ...) جایگزین شود.
-      console.log(`[OTP] کد ورود برای ${phone}: ${code}`);
-
-      res.json({ ok: true, devCode: process.env.NODE_ENV !== "production" ? code : undefined });
-    } catch (e) {
-      console.error(e);
-      res.status(500).json({ error: "خطای داخلی سرور." });
-    }
-  });
-
-  app.post("/api/auth/otp/verify", async (req, res) => {
-    try {
-      const { phone, otp } = req.body ?? {};
-      const entry = otpStore.get(phone);
-
-      if (!entry || entry.expiresAt < Date.now()) {
-        return res.status(400).json({ error: "کد منقضی شده است. دوباره درخواست دهید." });
-      }
-      if (entry.code !== otp) {
-        return res.status(400).json({ error: "کد وارد شده صحیح نیست." });
-      }
-      otpStore.delete(phone);
-
-      const user = await findUserByPhone(phone);
-      if (!user) return res.status(404).json({ error: "کاربری با این شماره موبایل یافت نشد." });
-      if (user.status !== "active") return res.status(403).json({ error: "حساب کاربری شما غیرفعال شده است." });
-
-      const jti = crypto.randomUUID();
-      const token = issueCitizenToken(user.id, jti);
-      await createCitizenSession(jti, user.id);
-      await updateLastLogin(user.id);
-      await logActivity({ userId: user.id, userLabel: user.fullName, action: "login_otp", detail: phone, ip: req.ip });
-
-      res.json({ token, user });
-    } catch (e) {
-      console.error(e);
-      res.status(500).json({ error: "خطای داخلی سرور." });
-    }
-  });
 
   // ==================== احراز هویت با گوگل ====================
 
