@@ -45,7 +45,7 @@ export async function initDb() {
 
   await p.query(`
     CREATE TABLE IF NOT EXISTS users (
-      id TEXT PRIMARY KEY,
+      id UUID PRIMARY KEY,
       first_name TEXT,
       last_name TEXT,
       full_name TEXT NOT NULL,
@@ -80,8 +80,8 @@ export async function initDb() {
 
   await p.query(`
     CREATE TABLE IF NOT EXISTS questions (
-      id TEXT PRIMARY KEY,
-      user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+      id UUID PRIMARY KEY,
+      user_id UUID REFERENCES users(id) ON DELETE SET NULL,
       title TEXT NOT NULL,
       description TEXT NOT NULL,
       created_at TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -90,8 +90,8 @@ export async function initDb() {
 
   await p.query(`
     CREATE TABLE IF NOT EXISTS responses (
-      id TEXT PRIMARY KEY,
-      question_id TEXT NOT NULL REFERENCES questions(id) ON DELETE CASCADE,
+      id UUID PRIMARY KEY,
+      question_id UUID NOT NULL REFERENCES questions(id) ON DELETE CASCADE,
       content TEXT NOT NULL,
       created_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
@@ -99,8 +99,8 @@ export async function initDb() {
 
   await p.query(`
     CREATE TABLE IF NOT EXISTS activity_logs (
-      id TEXT PRIMARY KEY,
-      user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+      id UUID PRIMARY KEY,
+      user_id UUID REFERENCES users(id) ON DELETE SET NULL,
       user_label TEXT,
       action TEXT NOT NULL,
       detail TEXT,
