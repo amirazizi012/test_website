@@ -27,7 +27,6 @@ export default function AdminLogin() {
         setError(data.error || "ورود ناموفق بود.");
         return;
       }
-      // فقط همینجا نشست ادمین ذخیره می‌شود؛ صفحه‌ی دیگری در میانه وجود ندارد.
       saveAdminSession(data.token, data.isDefault);
       navigate("/admin/dashboard", { replace: true });
     } catch {

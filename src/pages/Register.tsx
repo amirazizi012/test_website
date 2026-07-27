@@ -1,11 +1,11 @@
 import { useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { motion } from "motion/react";
+import { GoogleLogin, type CredentialResponse } from "@react-oauth/google";
 import { Shield, ArrowRight, Loader2, UserPlus } from "lucide-react";
 import { Input } from "../components/ui/Input";
 import { Button } from "../components/ui/Button";
 import { saveSession } from "../lib/auth";
-import GoogleSignInButton from "../components/GoogleSignInButton";
 
 export default function Register() {
   const navigate = useNavigate();
@@ -43,6 +43,33 @@ export default function Register() {
     }
   };
 
+  const handleGoogleSuccess = async (credentialResponse: CredentialResponse) => {
+    setError("");
+    if (!credentialResponse.credential) {
+      setError("ثبت‌نام با گوگل ناموفق بود.");
+      return;
+    }
+    setIsLoading(true);
+    try {
+      const res = await fetch("/api/auth/google", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ credential: credentialResponse.credential }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setError(data.error || "ثبت‌نام با گوگل ناموفق بود.");
+        return;
+      }
+      saveSession(data.token, data.user);
+      navigate("/dashboard/citizen");
+    } catch {
+      setError("ارتباط با سرور برقرار نشد.");
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
   return (
     <div className="min-h-screen bg-gradient-to-br from-[#fdfdfd] to-[#f0f4f2] flex flex-col items-center justify-center relative px-4 py-12 text-[#1A2E35] font-sans">
       <Link to="/" className="absolute top-8 right-8 text-[#64748B] hover:text-[#0F172A] flex items-center gap-2 transition-colors font-medium">
@@ -61,6 +88,24 @@ export default function Register() {
           </div>
           <h1 className="text-[28px] font-extrabold text-[#0F172A] tracking-tight mb-2">ثبت نام در سامانه</h1>
           <p className="text-[16px] text-[#64748B]">جهت استفاده از خدمات، اطلاعات هویتی خود را وارد نمایید.</p>
+        </div>
+
+        <div className="flex justify-center mb-6">
+          <GoogleLogin
+            onSuccess={handleGoogleSuccess}
+            onError={() => setError("ثبت‌نام با گوگل ناموفق بود.")}
+            useOneTap={false}
+            theme="filled_black"
+            text="signup_with"
+            shape="pill"
+            locale="fa"
+          />
+        </div>
+
+        <div className="flex items-center gap-3 mb-6">
+          <div className="h-px flex-1 bg-black/10" />
+          <span className="text-[13px] text-[#94A3B8] font-medium">یا با شماره موبایل</span>
+          <div className="h-px flex-1 bg-black/10" />
         </div>
 
         <form onSubmit={handleRegister} className="space-y-5">
@@ -94,13 +139,6 @@ export default function Register() {
           <Button type="submit" size="lg" className="w-full mt-6" disabled={isLoading}>
             {isLoading ? <Loader2 className="w-6 h-6 animate-spin" /> : "تکمیل ثبت نام"}
           </Button>
-
-          <div className="pt-2">
-            <GoogleSignInButton
-              onSuccess={() => navigate("/dashboard/citizen")}
-              onError={(msg) => setError(msg)}
-            />
-          </div>
         </form>
 
         <div className="mt-8 text-center border-t border-black/5 pt-6">

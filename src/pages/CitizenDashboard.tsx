@@ -6,7 +6,7 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import rehypeRaw from 'rehype-raw';
 import { Button } from "../components/ui/Button";
-import { getCurrentUser, logout, apiFetch } from "../lib/auth";
+import { getCurrentUser, getToken, logout } from "../lib/auth";
 
 const SIDEBAR_ITEMS = [
   { icon: Home, label: "داشبورد", active: false, path: "/dashboard/citizen" },
@@ -70,18 +70,25 @@ export default function CitizenDashboard() {
     setIsAsking(true);
 
     try {
-      const res = await apiFetch("/api/ai/stream", {
+      const res = await fetch("/api/ai/stream", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${getToken()}`,
+        },
         body: JSON.stringify({ 
           title: userMessage.split('\n')[0].replace('موضوع: ', ''), 
           description: userMessage 
         })
       });
 
-      if (res.status === 401) {
-        setChatHistory(prev => [...prev, { role: 'ai', content: "نشست شما منقضی شده، لطفاً دوباره وارد حساب کاربری خود شوید.", timestamp: new Date().toLocaleTimeString('fa-IR', { hour: '2-digit', minute: '2-digit' }) }]);
+      // اگر نشست منقضی/نامعتبر باشد (یا کاربر اصلاً ثبت‌نام نکرده باشد)، به صفحه‌ی ورود برگردد
+      if (res.status === 401 || res.status === 403) {
+        const data = await res.json().catch(() => ({}));
+        logout();
+        setChatHistory(prev => [...prev, { role: 'ai', content: data.error || "برای استفاده از مشاور هوشمند باید وارد حساب کاربری خود شوید.", timestamp: new Date().toLocaleTimeString('fa-IR', { hour: '2-digit', minute: '2-digit' }) }]);
         setIsAsking(false);
+        setTimeout(() => navigate("/auth/login"), 1500);
         return;
       }
 
@@ -127,7 +134,7 @@ export default function CitizenDashboard() {
                   const lastIndex = newHistory.length - 1;
                   newHistory[lastIndex] = {
                     ...newHistory[lastIndex],
-                    content: newHistory[lastIndex].content + "\n[خطا: " + data.error + (data.details ? " — " + data.details : "") + "]"
+                    content: newHistory[lastIndex].content + "\n[خطا: " + data.error + "]"
                   };
                   return newHistory;
                 });
@@ -205,8 +212,12 @@ export default function CitizenDashboard() {
               <p className="text-[16px] font-bold text-[#0F172A] leading-tight mb-1">{user?.fullName || "شهروند گرامی"}</p>
               <p className="text-[14px] text-[#64748B]">ایران، تهران</p>
             </div>
-            <div className="w-12 h-12 rounded-full bg-[#0D9488] border-4 border-white shadow-sm flex items-center justify-center text-white font-bold text-lg">
-              {user?.firstName?.charAt(0) || "م"}
+            <div className="w-12 h-12 rounded-full bg-[#0D9488] border-4 border-white shadow-sm flex items-center justify-center text-white font-bold text-lg overflow-hidden">
+              {user?.avatarUrl ? (
+                <img src={user.avatarUrl} alt={user.fullName} className="w-full h-full object-cover" />
+              ) : (
+                user?.firstName?.charAt(0) || "م"
+              )}
             </div>
           </div>
         </header>

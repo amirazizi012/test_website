@@ -1,11 +1,11 @@
 import { useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { motion, AnimatePresence } from "motion/react";
+import { GoogleLogin, type CredentialResponse } from "@react-oauth/google";
 import { Shield, ArrowRight, Loader2, KeyRound } from "lucide-react";
 import { Input } from "../components/ui/Input";
 import { Button } from "../components/ui/Button";
 import { saveSession } from "../lib/auth";
-import GoogleSignInButton from "../components/GoogleSignInButton";
 
 export default function Login() {
   const navigate = useNavigate();
@@ -58,6 +58,33 @@ export default function Login() {
       saveSession(data.token, data.user);
       navigate("/dashboard/citizen");
     } catch (e) {
+      setError("ارتباط با سرور برقرار نشد.");
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const handleGoogleSuccess = async (credentialResponse: CredentialResponse) => {
+    setError("");
+    if (!credentialResponse.credential) {
+      setError("ورود با گوگل ناموفق بود.");
+      return;
+    }
+    setIsLoading(true);
+    try {
+      const res = await fetch("/api/auth/google", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ credential: credentialResponse.credential }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setError(data.error || "ورود با گوگل ناموفق بود.");
+        return;
+      }
+      saveSession(data.token, data.user);
+      navigate("/dashboard/citizen");
+    } catch {
       setError("ارتباط با سرور برقرار نشد.");
     } finally {
       setIsLoading(false);
@@ -126,10 +153,21 @@ export default function Login() {
                 {isLoading ? <Loader2 className="w-6 h-6 animate-spin" /> : "دریافت کد تایید"}
               </Button>
 
-              <div className="pt-2">
-                <GoogleSignInButton
-                  onSuccess={() => navigate("/dashboard/citizen")}
-                  onError={(msg) => setError(msg)}
+              <div className="flex items-center gap-3 py-2">
+                <div className="h-px flex-1 bg-black/10" />
+                <span className="text-[13px] text-[#94A3B8] font-medium">یا</span>
+                <div className="h-px flex-1 bg-black/10" />
+              </div>
+
+              <div className="flex justify-center">
+                <GoogleLogin
+                  onSuccess={handleGoogleSuccess}
+                  onError={() => setError("ورود با گوگل ناموفق بود.")}
+                  useOneTap={false}
+                  theme="filled_black"
+                  text="continue_with"
+                  shape="pill"
+                  locale="fa"
                 />
               </div>
             </motion.form>
