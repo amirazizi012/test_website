@@ -53,9 +53,6 @@ import {
 
 const PORT = 3000;
 
-// کد تایید هر شماره موبایل: phone -> { code, expiresAt } — کوتاه‌مدت است، در حافظه کافی است
-//const otpStore = new Map<string, { code: string; expiresAt: number }>();
-
 // جلوگیری ساده از حدس‌زدن رمز مدیر: بعد از ۵ تلاش ناموفق، ۵ دقیقه قفل
 const adminLoginAttempts = new Map<string, { count: number; lockedUntil: number }>();
 
@@ -204,9 +201,6 @@ async function startServer() {
       res.status(500).json({ error: "خطای داخلی سرور." });
     }
   });
-
- /// app.post("/api/auth/otp/send", async (req, res) => {
-
 
   // ==================== احراز هویت با گوگل ====================
 
