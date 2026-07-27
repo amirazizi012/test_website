@@ -5,16 +5,19 @@ import path from "path";
 import crypto from "crypto";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI } from "@google/genai";
+
 import {
   initDb,
   findUserByPhone,
   findUserByNationalCode,
+  findUserByEmailOrGoogleId,
+  findUserById,
   insertUser,
+  linkGoogleToUser,
+  updateLastLogin,
   getAllUsers,
   countUsers,
-  createSession,
-  createAdminSession,
-  isValidAdminSession,
+  setUserStatus,
   hashPassword,
   verifyPassword,
   getAdminConfig,
@@ -28,31 +31,33 @@ import {
   insertQuestion,
   insertResponse,
   countQuestions,
-  type StoredUser,
+  logActivity,
+  getRecentActivity,
   type CrisisLawEntry,
 } from "./db";
 
+import {
+  createCitizenSession,
+  getCitizenSessionUserId,
+  createAdminSession,
+  isAdminSessionValid,
+} from "./redis";
+
+import {
+  issueCitizenToken,
+  verifyCitizenToken,
+  issueAdminToken,
+  verifyAdminToken,
+  verifyGoogleIdToken,
+} from "./server-auth";
+
 const PORT = 3000;
 
-// کد تایید هر شماره موبایل: phone -> { code, expiresAt } — کوتاه‌مدت است، در حافظه کافیست
+// کد تایید هر شماره موبایل: phone -> { code, expiresAt } — کوتاه‌مدت است، در حافظه کافی است
 const otpStore = new Map<string, { code: string; expiresAt: number }>();
 
 // جلوگیری ساده از حدس‌زدن رمز مدیر: بعد از ۵ تلاش ناموفق، ۵ دقیقه قفل
 const adminLoginAttempts = new Map<string, { count: number; lockedUntil: number }>();
-
-async function authenticateAdmin(req: Request, res: Response, next: NextFunction) {
-  try {
-    const header = req.headers.authorization;
-    const token = header?.startsWith("Bearer ") ? header.slice(7) : null;
-    if (!token || !(await isValidAdminSession(token))) {
-      return res.status(401).json({ error: "دسترسی غیرمجاز. لطفاً وارد پنل مدیریت شوید." });
-    }
-    next();
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: "خطای داخلی سرور." });
-  }
-}
 
 let ai: GoogleGenAI | null = null;
 function getAI() {
@@ -64,9 +69,61 @@ function getAI() {
   return ai;
 }
 
-// ⚠️ فهرست شروع (starter) قوانین. عناوین واقعی‌اند، اما شرح‌ها خلاصه و کلی‌اند
-// و شماره‌ی ماده/تبصره‌ی دقیق ندارند. پیش از تکیه‌ی واقعی شهروندان در شرایط
-// بحران/جنگ، این فهرست باید توسط یک وکیل یا کارشناس حقوقی بازبینی و تکمیل شود.
+// ==================== Middlewares ====================
+
+async function authenticateCitizen(req: Request, res: Response, next: NextFunction) {
+  try {
+    const header = req.headers.authorization;
+    const token = header?.startsWith("Bearer ") ? header.slice(7) : null;
+    if (!token) {
+      return res.status(401).json({ error: "برای استفاده از مشاور هوشمند ابتدا باید ثبت‌نام یا وارد حساب کاربری خود شوید." });
+    }
+
+    const payload = verifyCitizenToken(token);
+    if (!payload) {
+      return res.status(401).json({ error: "نشست شما نامعتبر یا منقضی شده است. دوباره وارد شوید." });
+    }
+
+    const sessionUserId = await getCitizenSessionUserId(payload.jti);
+    if (!sessionUserId || sessionUserId !== payload.sub) {
+      return res.status(401).json({ error: "نشست شما منقضی شده است. دوباره وارد شوید." });
+    }
+
+    const user = await findUserById(payload.sub);
+    if (!user || user.status !== "active") {
+      return res.status(403).json({ error: "حساب کاربری شما غیرفعال یا حذف شده است." });
+    }
+
+    (req as any).userId = user.id;
+    (req as any).currentUser = user;
+    next();
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "خطای داخلی سرور." });
+  }
+}
+
+async function authenticateAdmin(req: Request, res: Response, next: NextFunction) {
+  try {
+    const header = req.headers.authorization;
+    const token = header?.startsWith("Bearer ") ? header.slice(7) : null;
+    if (!token) return res.status(401).json({ error: "دسترسی غیرمجاز. لطفاً وارد پنل مدیریت شوید." });
+
+    const payload = verifyAdminToken(token);
+    if (!payload) return res.status(401).json({ error: "نشست شما نامعتبر یا منقضی شده است." });
+
+    const valid = await isAdminSessionValid(payload.jti);
+    if (!valid) return res.status(401).json({ error: "نشست شما منقضی شده است. دوباره وارد شوید." });
+
+    next();
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "خطای داخلی سرور." });
+  }
+}
+
+// ⚠️ فهرست شروع (starter) قوانین. عناوین واقعی‌اند، اما شرح‌ها خلاصه و کلی‌اند.
+// پیش از تکیه‌ی واقعی شهروندان در شرایط بحران/جنگ، باید توسط یک وکیل بازبینی شود.
 const DEFAULT_LAWS: CrisisLawEntry[] = [
   { id: "1", title: "قانون مدیریت بحران کشور", category: "مدیریت بحران", description: "چارچوب سازماندهی، فرماندهی واحد و هماهنگی دستگاه‌های اجرایی و امدادی کشور پیش، حین و پس از بحران‌های طبیعی و غیرطبیعی از جمله جنگ." },
   { id: "2", title: "قانون بیمه همگانی حوادث طبیعی", category: "حمایتی", description: "پوشش بیمه‌ای در برابر خسارات ناشی از حوادث طبیعی مانند زلزله و سیل برای اموال و مسکن شهروندان؛ نحوه‌ی مطالبه‌ی غرامت از صندوق بیمه." },
@@ -96,18 +153,13 @@ async function startServer() {
 
   const app = express();
 
-  // Render (مثل هر PaaS دیگه) اپ شما را پشت یک reverse proxy اجرا می‌کند.
+  // Render اپ شما را پشت یک reverse proxy اجرا می‌کند.
   app.set("trust proxy", 1);
-
   app.use(express.json());
 
-  // === API ROUTES ===
+  app.get("/api/health", (req, res) => res.json({ status: "ok" }));
 
-  app.get("/api/health", (req, res) => {
-    res.json({ status: "ok" });
-  });
-
-  // ==================== احراز هویت شهروندان — بدون هیچ تغییری در منطق ====================
+  // ==================== احراز هویت شهروندان با شماره موبایل (OTP) ====================
 
   app.post("/api/auth/register", async (req, res) => {
     try {
@@ -122,7 +174,6 @@ async function startServer() {
       if (!/^09\d{9}$/.test(phone)) {
         return res.status(400).json({ error: "شماره موبایل معتبر نیست (مثال: 09123456789)." });
       }
-
       if (await findUserByPhone(phone)) {
         return res.status(409).json({ error: "کاربری با این شماره موبایل قبلاً ثبت‌نام کرده است." });
       }
@@ -130,7 +181,7 @@ async function startServer() {
         return res.status(409).json({ error: "کاربری با این کد ملی قبلاً ثبت‌نام کرده است." });
       }
 
-      const user: StoredUser = {
+      const user = await insertUser({
         id: crypto.randomUUID(),
         firstName: firstName.trim(),
         lastName: lastName.trim(),
@@ -138,11 +189,14 @@ async function startServer() {
         nationalCode,
         phone,
         role: "Citizen",
-        createdAt: new Date().toISOString(),
-      };
+        status: "active",
+      });
 
-      await insertUser(user);
-      const token = await createSession(user.id);
+      const jti = crypto.randomUUID();
+      const token = issueCitizenToken(user.id, jti);
+      await createCitizenSession(jti, user.id);
+      await updateLastLogin(user.id);
+      await logActivity({ userId: user.id, userLabel: user.fullName, action: "register", detail: phone, ip: req.ip });
 
       res.status(201).json({ token, user });
     } catch (e) {
@@ -157,7 +211,6 @@ async function startServer() {
       if (!/^09\d{9}$/.test(phone ?? "")) {
         return res.status(400).json({ error: "شماره موبایل معتبر نیست." });
       }
-
       const user = await findUserByPhone(phone);
       if (!user) {
         return res.status(404).json({ error: "کاربری با این شماره موبایل یافت نشد. ابتدا ثبت‌نام کنید." });
@@ -169,10 +222,7 @@ async function startServer() {
       // TODO: این بخش باید در نسخه واقعی با یک سرویس پیامک (کاوه‌نگار، ملی‌پیامک و ...) جایگزین شود.
       console.log(`[OTP] کد ورود برای ${phone}: ${code}`);
 
-      res.json({
-        ok: true,
-        devCode: process.env.NODE_ENV !== "production" ? code : undefined,
-      });
+      res.json({ ok: true, devCode: process.env.NODE_ENV !== "production" ? code : undefined });
     } catch (e) {
       console.error(e);
       res.status(500).json({ error: "خطای داخلی سرور." });
@@ -193,11 +243,74 @@ async function startServer() {
       otpStore.delete(phone);
 
       const user = await findUserByPhone(phone);
+      if (!user) return res.status(404).json({ error: "کاربری با این شماره موبایل یافت نشد." });
+      if (user.status !== "active") return res.status(403).json({ error: "حساب کاربری شما غیرفعال شده است." });
+
+      const jti = crypto.randomUUID();
+      const token = issueCitizenToken(user.id, jti);
+      await createCitizenSession(jti, user.id);
+      await updateLastLogin(user.id);
+      await logActivity({ userId: user.id, userLabel: user.fullName, action: "login_otp", detail: phone, ip: req.ip });
+
+      res.json({ token, user });
+    } catch (e) {
+      console.error(e);
+      res.status(500).json({ error: "خطای داخلی سرور." });
+    }
+  });
+
+  // ==================== احراز هویت با گوگل ====================
+
+  app.post("/api/auth/google", async (req, res) => {
+    try {
+      const { credential } = req.body ?? {};
+      if (!credential) return res.status(400).json({ error: "توکن گوگل ارسال نشده است." });
+
+      let payload;
+      try {
+        payload = await verifyGoogleIdToken(credential);
+      } catch (e) {
+        console.error("خطا در تایید گوگل:", e);
+        return res.status(401).json({ error: "تایید هویت گوگل ناموفق بود." });
+      }
+      if (!payload?.email) return res.status(400).json({ error: "ایمیل در پاسخ گوگل یافت نشد." });
+      if (payload.email_verified === false) return res.status(400).json({ error: "ایمیل گوگل شما تایید نشده است." });
+
+      let user = await findUserByEmailOrGoogleId(payload.email, payload.sub!);
+      let isNew = false;
       if (!user) {
-        return res.status(404).json({ error: "کاربری با این شماره موبایل یافت نشد." });
+        user = await insertUser({
+          id: crypto.randomUUID(),
+          firstName: payload.given_name ?? null,
+          lastName: payload.family_name ?? null,
+          fullName: payload.name ?? payload.email,
+          email: payload.email,
+          googleId: payload.sub,
+          avatarUrl: payload.picture ?? null,
+          role: "Citizen",
+          status: "active",
+        });
+        isNew = true;
+      } else if (!user.googleId) {
+        await linkGoogleToUser(user.id, payload.sub!, payload.picture ?? null);
       }
 
-      const token = await createSession(user.id);
+      if (user.status !== "active") {
+        return res.status(403).json({ error: "حساب کاربری شما غیرفعال شده است." });
+      }
+
+      const jti = crypto.randomUUID();
+      const token = issueCitizenToken(user.id, jti);
+      await createCitizenSession(jti, user.id);
+      await updateLastLogin(user.id);
+      await logActivity({
+        userId: user.id,
+        userLabel: user.fullName,
+        action: isNew ? "register_google" : "login_google",
+        detail: user.email ?? undefined,
+        ip: req.ip,
+      });
+
       res.json({ token, user });
     } catch (e) {
       console.error(e);
@@ -217,9 +330,7 @@ async function startServer() {
         const waitMin = Math.ceil((attempt.lockedUntil - Date.now()) / 60000);
         return res.status(429).json({ error: `تعداد تلاش‌های ناموفق بیش از حد است. ${waitMin} دقیقه دیگر دوباره امتحان کنید.` });
       }
-      if (!password) {
-        return res.status(400).json({ error: "رمز عبور الزامی است." });
-      }
+      if (!password) return res.status(400).json({ error: "رمز عبور الزامی است." });
 
       const config = await getAdminConfig();
       if (!verifyPassword(password, config.passwordHash)) {
@@ -232,9 +343,13 @@ async function startServer() {
         adminLoginAttempts.set(ip, current);
         return res.status(401).json({ error: "رمز عبور نادرست است." });
       }
-
       adminLoginAttempts.delete(ip);
-      const token = await createAdminSession();
+
+      const jti = crypto.randomUUID();
+      const token = issueAdminToken(jti);
+      await createAdminSession(jti);
+      await logActivity({ action: "admin_login", ip: req.ip });
+
       res.json({ token, isDefault: config.isDefault });
     } catch (e) {
       console.error(e);
@@ -255,6 +370,7 @@ async function startServer() {
       }
 
       await updateAdminConfig(hashPassword(newPassword), false);
+      await logActivity({ action: "admin_change_password", ip: req.ip });
       res.json({ ok: true });
     } catch (e) {
       console.error(e);
@@ -284,6 +400,31 @@ async function startServer() {
     }
   });
 
+  app.patch("/api/admin/users/:id/status", authenticateAdmin, async (req, res) => {
+    try {
+      const { status } = req.body ?? {};
+      if (status !== "active" && status !== "suspended") {
+        return res.status(400).json({ error: "وضعیت نامعتبر است." });
+      }
+      const updated = await setUserStatus(req.params.id, status);
+      if (!updated) return res.status(404).json({ error: "کاربر یافت نشد." });
+      await logActivity({ userId: updated.id, userLabel: updated.fullName, action: "admin_set_user_status", detail: status, ip: req.ip });
+      res.json(updated);
+    } catch (e) {
+      console.error(e);
+      res.status(500).json({ error: "خطای داخلی سرور." });
+    }
+  });
+
+  app.get("/api/admin/activity", authenticateAdmin, async (req, res) => {
+    try {
+      res.json(await getRecentActivity(200));
+    } catch (e) {
+      console.error(e);
+      res.status(500).json({ error: "خطای داخلی سرور." });
+    }
+  });
+
   app.get("/api/admin/laws", authenticateAdmin, async (req, res) => {
     try {
       res.json(await getAllLaws());
@@ -299,13 +440,9 @@ async function startServer() {
       if (!title?.trim() || !category?.trim() || !description?.trim()) {
         return res.status(400).json({ error: "تکمیل تمام فیلدها الزامی است." });
       }
-      const newLaw: CrisisLawEntry = {
-        id: crypto.randomUUID(),
-        title: title.trim(),
-        category: category.trim(),
-        description: description.trim(),
-      };
+      const newLaw: CrisisLawEntry = { id: crypto.randomUUID(), title: title.trim(), category: category.trim(), description: description.trim() };
       await insertLaw(newLaw);
+      await logActivity({ action: "law_added", detail: newLaw.title, ip: req.ip });
       res.status(201).json(newLaw);
     } catch (e) {
       console.error(e);
@@ -318,6 +455,7 @@ async function startServer() {
       const { title, category, description } = req.body ?? {};
       const updated = await updateLaw(req.params.id, { title, category, description });
       if (!updated) return res.status(404).json({ error: "قانون یافت نشد." });
+      await logActivity({ action: "law_updated", detail: updated.title, ip: req.ip });
       res.json(updated);
     } catch (e) {
       console.error(e);
@@ -329,6 +467,7 @@ async function startServer() {
     try {
       const ok = await deleteLaw(req.params.id);
       if (!ok) return res.status(404).json({ error: "قانون یافت نشد." });
+      await logActivity({ action: "law_deleted", detail: req.params.id, ip: req.ip });
       res.json({ ok: true });
     } catch (e) {
       console.error(e);
@@ -336,12 +475,13 @@ async function startServer() {
     }
   });
 
-  // ==================== مشاور هوشمند (Streaming SSE) ====================
+  // ==================== مشاور هوشمند — فقط برای کاربران ثبت‌نام‌شده ====================
 
-  app.post("/api/ai/stream", async (req, res) => {
+  app.post("/api/ai/stream", authenticateCitizen, async (req, res) => {
     try {
       const { title, description } = req.body;
       if (!title || !description) return res.status(400).json({ error: "Title and description required" });
+      const userId = (req as any).userId as string;
 
       res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
       res.setHeader('Cache-Control', 'no-cache');
@@ -375,10 +515,10 @@ async function startServer() {
         }
       }
 
-      // ذخیره‌ی دائمی پرسش و پاسخ در دیتابیس (دیگر با ری‌استارت سرور پاک نمی‌شود)
       const qId = crypto.randomUUID();
-      await insertQuestion({ id: qId, title, description });
+      await insertQuestion({ id: qId, userId, title, description });
       await insertResponse({ id: crypto.randomUUID(), questionId: qId, content: fullText });
+      await logActivity({ userId, action: "chat_question", detail: title, ip: req.ip });
 
       res.write(`data: [DONE]\n\n`);
       res.end();
@@ -401,17 +541,12 @@ async function startServer() {
 
   // === VITE MIDDLEWARE ===
   if (process.env.NODE_ENV !== "production") {
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: "spa",
-    });
+    const vite = await createViteServer({ server: { middlewareMode: true }, appType: "spa" });
     app.use(vite.middlewares);
   } else {
     const distPath = path.join(process.cwd(), 'dist');
     app.use(express.static(distPath));
-    app.get('*', (req, res) => {
-      res.sendFile(path.join(distPath, 'index.html'));
-    });
+    app.get('*', (req, res) => res.sendFile(path.join(distPath, 'index.html')));
   }
 
   app.listen(PORT, "0.0.0.0", () => {
